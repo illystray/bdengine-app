@@ -1,0 +1,55 @@
+{
+    "$schema":  "../node_modules/@tauri-apps/cli/config.schema.json",
+    "productName":  "BDEngine",
+    "version":  "0.1.0",
+    "identifier":  "app.bdengine.desktop",
+    "build":  {
+                  "frontendDist":  "https://bdengine.app/?appReal=true",
+                  "devUrl":  "https://bdengine.app/?appReal=true"
+              },
+    "app":  {
+                "windows":  [
+                                {
+                                    "label":  "main",
+                                    "create":  false,
+                                    "title":  "BDEngine",
+                                    "width":  1740,
+                                    "height":  900,
+                                    "minWidth":  1024,
+                                    "minHeight":  720,
+                                    "resizable":  true,
+                                    "dragDropEnabled":  false,
+                                    "fullscreen":  false,
+                                    "center":  true,
+                                    "maximized":  true,
+                                    "decorations":  false
+                                }
+                            ],
+                "security":  {
+                                 "csp":  null
+                             }
+            },
+    "bundle":  {
+                   "active":  true,
+                   "targets":  "all",
+                   "publisher":  "illystray",
+                   "homepage":  "https://bdengine.app",
+                   "fileAssociations":  [
+                                            {
+                                                "ext":  [
+                                                            "bdengine"
+                                                        ],
+                                                "name":  "BDEngine File",
+                                                "description":  "BDEngine Project File",
+                                                "role":  "Viewer"
+                                            }
+                                        ],
+                   "icon":  [
+                                "icons/32x32.png",
+                                "icons/128x128.png",
+                                "icons/128x128@2x.png",
+                                "icons/icon.icns",
+                                "icons/icon.ico"
+                            ]
+               }
+}

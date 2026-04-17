@@ -1,0 +1,22 @@
+{
+    "$schema":  "../gen/schemas/desktop-schema.json",
+    "identifier":  "default",
+    "description":  "enables the default permissions",
+    "remote":  {
+                   "urls":  [
+                                "https://bdengine.app",
+                                "https://bdengine.app/*",
+                                "https://beta.bdengine.app",
+                                "https://beta.bdengine.app/*"
+                            ]
+               },
+    "windows":  [
+                    "main"
+                ],
+    "permissions":  [
+                        "core:default",
+                        "core:window:allow-minimize",
+                        "core:window:allow-toggle-maximize",
+                        "core:window:allow-close"
+                    ]
+}

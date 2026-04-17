@@ -1,0 +1,25 @@
+*
+
+# Keep repository metadata / docs
+!.gitignore
+!README.md
+!LICENSE
+
+# Keep only the desktop app source snapshot
+!src-tauri/
+src-tauri/*
+!src-tauri/src/
+!src-tauri/src/**
+!src-tauri/icons/
+!src-tauri/icons/**
+!src-tauri/capabilities/
+!src-tauri/capabilities/**
+!src-tauri/Cargo.toml
+!src-tauri/Cargo.lock
+!src-tauri/tauri.conf.json
+!src-tauri/build.rs
+
+# Keep the Inno Setup installer script
+!installer/
+installer/*
+!installer/bdengine.iss
