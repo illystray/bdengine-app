@@ -41,7 +41,7 @@ const BETA_BASE_URL: &str = "https://beta.bdengine.app/";
 const TASKBAR_ICON_PNG: &[u8] = include_bytes!("../icons/32x32.png");
 const APP_CONFIG_FILE_NAME: &str = "config.json";
 const APP_IDENTIFIER: &str = "app.bdengine.desktop";
-const APP_VERSION: u32 = 1;
+const APP_VERSION: u32 = 2;
 #[cfg(target_os = "windows")]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 #[cfg(target_os = "windows")]
@@ -847,7 +847,6 @@ fn create_main_window(app: &tauri::AppHandle, context: &LaunchContext) -> tauri:
 fn apply_launch_context(app: &tauri::AppHandle, context: LaunchContext) -> tauri::Result<()> {
   let state = app.state::<AppState>();
   state.set_launch_context(context.clone());
-  let target_url = build_remote_url(&context, state.get_release_channel());
 
   let window = if let Some(window) = app.get_webview_window(MAIN_WINDOW_LABEL) {
     window
@@ -860,16 +859,7 @@ fn apply_launch_context(app: &tauri::AppHandle, context: LaunchContext) -> tauri
   }
   let _ = window.set_focus();
 
-  let should_navigate = match window.url() {
-    Ok(current_url) => current_url != target_url,
-    Err(_) => true,
-  };
-
-  if should_navigate {
-    window.navigate(target_url)?;
-  } else {
-    dispatch_launch_context(&window, &context)?;
-  }
+  dispatch_launch_context(&window, &context)?;
 
   Ok(())
 }
@@ -901,7 +891,7 @@ fn set_release_channel(
 }
 
 #[tauri::command]
-fn write_project_file(path: String, content: String) -> Result<(), String> {
+fn write_project_file(path: String, content: Vec<u8>) -> Result<(), String> {
   let trimmed_path = path.trim();
   if trimmed_path.is_empty() {
     return Err("Project file path is empty.".into());
@@ -989,4 +979,3 @@ pub fn run() {
     .run(tauri::generate_context!())
     .expect("error while running tauri application");
 }
-
