@@ -1,5 +1,5 @@
 #define AppName "BDEngine"
-#define AppVersion "1.0.1"
+#define AppVersion "1.0.2"
 #define AppPublisher "illystray Creations"
 #define AppExeName "bdengine_app.exe"
 #define AppAssocName "BDEngine File"
@@ -37,8 +37,8 @@ Source: "..\build\steam\content\{#AppExeName}"; DestDir: "{app}"; Flags: ignorev
 Source: "..\build\steam\content\fileicons\bdengine-file.ico"; DestDir: "{app}\fileicons"; Flags: ignoreversion
 
 [Icons]
-Name: "{autoprograms}\{#AppName}"; Filename: "{app}\{#AppExeName}"
-Name: "{autodesktop}\{#AppName}"; Filename: "{app}\{#AppExeName}"; Tasks: desktopicon
+Name: "{autoprograms}\{#AppName}"; Filename: "{app}\{#AppExeName}"; AppUserModelID: "app.bdengine.desktop"
+Name: "{autodesktop}\{#AppName}"; Filename: "{app}\{#AppExeName}"; Tasks: desktopicon; AppUserModelID: "app.bdengine.desktop"
 
 [Registry]
 Root: HKCU; Subkey: "Software\Classes\{#AppProtocol}"; ValueType: string; ValueName: ""; ValueData: "URL:{#AppName} Protocol"; Flags: uninsdeletekey

@@ -41,7 +41,7 @@ const BETA_BASE_URL: &str = "https://beta.bdengine.app/";
 const TASKBAR_ICON_PNG: &[u8] = include_bytes!("../icons/32x32.png");
 const APP_CONFIG_FILE_NAME: &str = "config.json";
 const APP_IDENTIFIER: &str = "app.bdengine.desktop";
-const APP_VERSION: u32 = 2;
+const APP_VERSION: u32 = 3;
 #[cfg(target_os = "windows")]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 #[cfg(target_os = "windows")]
@@ -966,6 +966,7 @@ pub fn run() {
       clipboard_read_items,
       clipboard_write_items
     ])
+    .plugin(tauri_plugin_notification::init())
     .plugin(tauri_plugin_single_instance::init(|app, argv, _cwd| {
       let context = parse_launch_context(argv.into_iter().skip(1));
       let _ = apply_launch_context(app, context);
