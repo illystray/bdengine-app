@@ -1,5 +1,5 @@
 #define AppName "BDEngine"
-#define AppVersion "1.0.2"
+#define AppVersion "1.0.3"
 #define AppPublisher "illystray Creations"
 #define AppExeName "bdengine_app.exe"
 #define AppAssocName "BDEngine File"
@@ -26,11 +26,8 @@ PrivilegesRequiredOverridesAllowed=dialog
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 ChangesAssociations=yes
-DisableDirPage=no
+DisableDirPage=yes
 DisableProgramGroupPage=yes
-
-[Tasks]
-Name: "desktopicon"; Description: "Create a desktop shortcut"; GroupDescription: "Additional shortcuts:"
 
 [Files]
 Source: "..\build\steam\content\{#AppExeName}"; DestDir: "{app}"; Flags: ignoreversion
@@ -38,7 +35,7 @@ Source: "..\build\steam\content\fileicons\bdengine-file.ico"; DestDir: "{app}\fi
 
 [Icons]
 Name: "{autoprograms}\{#AppName}"; Filename: "{app}\{#AppExeName}"; AppUserModelID: "app.bdengine.desktop"
-Name: "{autodesktop}\{#AppName}"; Filename: "{app}\{#AppExeName}"; Tasks: desktopicon; AppUserModelID: "app.bdengine.desktop"
+Name: "{autodesktop}\{#AppName}"; Filename: "{app}\{#AppExeName}"; AppUserModelID: "app.bdengine.desktop"
 
 [Registry]
 Root: HKCU; Subkey: "Software\Classes\{#AppProtocol}"; ValueType: string; ValueName: ""; ValueData: "URL:{#AppName} Protocol"; Flags: uninsdeletekey

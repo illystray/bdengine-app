@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::{
   env,
   fs,
+  io::{Read, Write},
   mem,
   path::{Path, PathBuf},
   process::{Command, Stdio},
@@ -15,7 +16,7 @@ use std::os::windows::process::CommandExt;
 use tauri::{
   image::Image,
   webview::{DownloadEvent, NewWindowResponse, PageLoadEvent},
-  Manager, WebviewUrl, WebviewWindow, WebviewWindowBuilder,
+  Emitter, Manager, WebviewUrl, WebviewWindow, WebviewWindowBuilder,
 };
 use url::Url;
 #[cfg(target_os = "windows")]
@@ -41,9 +42,15 @@ const BETA_BASE_URL: &str = "https://beta.bdengine.app/";
 const TASKBAR_ICON_PNG: &[u8] = include_bytes!("../icons/32x32.png");
 const APP_CONFIG_FILE_NAME: &str = "config.json";
 const APP_IDENTIFIER: &str = "app.bdengine.desktop";
-const APP_VERSION: u32 = 3;
+const APP_VERSION: u32 = 4;
+const UPDATE_DOWNLOAD_STARTED_EVENT: &str = "update-download-started";
+const UPDATE_DOWNLOAD_PROGRESS_EVENT: &str = "update-download-progress";
+const UPDATE_DOWNLOAD_FINISHED_EVENT: &str = "update-download-finished";
+const UPDATE_DOWNLOAD_FAILED_EVENT: &str = "update-download-failed";
 #[cfg(target_os = "windows")]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
+#[cfg(target_os = "windows")]
+const CF_DIB_FORMAT: u32 = 8;
 #[cfg(target_os = "windows")]
 const WEBVIEW2_DOWNLOAD_URL: &str = "https://developer.microsoft.com/en-us/microsoft-edge/webview2";
 #[cfg(target_os = "windows")]
@@ -96,6 +103,36 @@ struct ClipboardItemPayload {
   base64: Option<String>,
 }
 
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct UpdateDownloadStartedPayload {
+  file_name: String,
+  total_bytes: Option<u64>,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct UpdateDownloadProgressPayload {
+  file_name: String,
+  downloaded_bytes: u64,
+  total_bytes: Option<u64>,
+  progress_percent: Option<f64>,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct UpdateDownloadFinishedPayload {
+  file_name: String,
+  path: String,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct UpdateDownloadFailedPayload {
+  file_name: String,
+  error: String,
+}
+
 #[derive(Clone, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct LaunchContext {
@@ -130,6 +167,7 @@ struct LaunchFile {
 struct AppState {
   launch_context: Mutex<LaunchContext>,
   release_channel: Mutex<ReleaseChannel>,
+  pending_installer_path: Mutex<Option<PathBuf>>,
 }
 
 impl AppState {
@@ -147,6 +185,28 @@ impl AppState {
 
   fn set_release_channel(&self, channel: ReleaseChannel) {
     *self.release_channel.lock().expect("release channel state poisoned") = channel;
+  }
+
+  fn set_pending_installer_path(&self, path: PathBuf) {
+    *self
+      .pending_installer_path
+      .lock()
+      .expect("pending installer state poisoned") = Some(path);
+  }
+
+  fn clear_pending_installer_path(&self) {
+    *self
+      .pending_installer_path
+      .lock()
+      .expect("pending installer state poisoned") = None;
+  }
+
+  fn take_pending_installer_path(&self) -> Option<PathBuf> {
+    self
+      .pending_installer_path
+      .lock()
+      .expect("pending installer state poisoned")
+      .take()
   }
 }
 
@@ -445,6 +505,47 @@ fn set_clipboard_registered_bytes(format: u32, bytes: &[u8]) -> Result<(), Strin
 }
 
 #[cfg(target_os = "windows")]
+fn png_bytes_to_cf_dib(bytes: &[u8]) -> Result<Vec<u8>, String> {
+  let image = image::load_from_memory(bytes)
+    .map_err(|err| format!("Could not decode image/png for CF_DIB: {err}"))?
+    .to_rgba8();
+
+  let width = image.width();
+  let height = image.height();
+
+  if width == 0 || height == 0 {
+    return Err("Image is empty.".into());
+  }
+
+  let row_stride = width as usize * 4;
+  let pixel_bytes_len = row_stride * height as usize;
+
+  let mut dib = Vec::with_capacity(40 + pixel_bytes_len);
+
+  dib.extend_from_slice(&40u32.to_le_bytes());
+  dib.extend_from_slice(&(width as i32).to_le_bytes());
+  dib.extend_from_slice(&(-(height as i32)).to_le_bytes());
+  dib.extend_from_slice(&1u16.to_le_bytes());
+  dib.extend_from_slice(&32u16.to_le_bytes());
+  dib.extend_from_slice(&0u32.to_le_bytes());
+  dib.extend_from_slice(&(pixel_bytes_len as u32).to_le_bytes());
+  dib.extend_from_slice(&0i32.to_le_bytes());
+  dib.extend_from_slice(&0i32.to_le_bytes());
+  dib.extend_from_slice(&0u32.to_le_bytes());
+  dib.extend_from_slice(&0u32.to_le_bytes());
+
+  for pixel in image.pixels() {
+    let [r, g, b, a] = pixel.0;
+    dib.push(b);
+    dib.push(g);
+    dib.push(r);
+    dib.push(a);
+  }
+
+  Ok(dib)
+}
+
+#[cfg(target_os = "windows")]
 fn read_clipboard_items_windows() -> Vec<ClipboardItemPayload> {
   let mut items = Vec::new();
 
@@ -500,7 +601,11 @@ fn write_clipboard_items_windows(items: &[ClipboardItemPayload]) -> Result<(), S
         let bytes = BASE64
           .decode(base64)
           .map_err(|err| format!("Could not decode image/png clipboard payload: {err}"))?;
+
         set_clipboard_registered_bytes(png_clipboard_format(), &bytes)?;
+
+        let dib = png_bytes_to_cf_dib(&bytes)?;
+        set_clipboard_registered_bytes(CF_DIB_FORMAT, &dib)?;
       }
       _ => {}
     }
@@ -632,6 +737,66 @@ fn persist_release_channel(app: &tauri::AppHandle, channel: ReleaseChannel) -> R
 
 fn taskbar_icon() -> Option<Image<'static>> {
   Image::from_bytes(TASKBAR_ICON_PNG).ok().map(|icon| icon.to_owned())
+}
+
+fn update_downloads_dir() -> PathBuf {
+  env::temp_dir().join(APP_IDENTIFIER).join("updates")
+}
+
+fn sanitize_download_file_name(file_name: &str) -> Result<String, String> {
+  let trimmed_name = file_name.trim();
+  if trimmed_name.is_empty() {
+    return Err("File name is empty.".into());
+  }
+
+  Path::new(trimmed_name)
+    .file_name()
+    .and_then(|name| name.to_str())
+    .filter(|name| !name.trim().is_empty())
+    .map(|name| name.to_string())
+    .ok_or_else(|| "Could not resolve download file name.".into())
+}
+
+fn emit_update_download_failed(app: &tauri::AppHandle, file_name: String, error: String) {
+  let _ = app.emit(
+    UPDATE_DOWNLOAD_FAILED_EVENT,
+    UpdateDownloadFailedPayload { file_name, error },
+  );
+}
+
+#[cfg(target_os = "windows")]
+fn launch_installer(installer_path: &Path) -> Result<(), String> {
+  Command::new(installer_path)
+    .spawn()
+    .map_err(|err| format!("Could not launch installer: {err}"))?;
+  Ok(())
+}
+
+#[cfg(not(target_os = "windows"))]
+fn launch_installer(installer_path: &Path) -> Result<(), String> {
+  Command::new(installer_path)
+    .spawn()
+    .map_err(|err| format!("Could not launch installer: {err}"))?;
+  Ok(())
+}
+
+fn launch_pending_installer_if_any(app: &tauri::AppHandle) {
+  let state = app.state::<AppState>();
+  let Some(installer_path) = state.take_pending_installer_path() else {
+    return;
+  };
+
+  if let Err(err) = launch_installer(&installer_path) {
+    emit_update_download_failed(
+      app,
+      installer_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("update-installer")
+        .to_string(),
+      err,
+    );
+  }
 }
 
 fn parse_launch_context<I, S>(args: I) -> LaunchContext
@@ -901,6 +1066,125 @@ fn write_project_file(path: String, content: Vec<u8>) -> Result<(), String> {
 }
 
 #[tauri::command]
+fn save_binary_file(file_name: String, content: Vec<u8>) -> Result<Option<String>, String> {
+  let trimmed_name = file_name.trim();
+  if trimmed_name.is_empty() {
+    return Err("File name is empty.".into());
+  }
+
+  let suggested_path = PathBuf::from(trimmed_name);
+  let Some(path) = prompt_download_destination(&suggested_path) else {
+    return Ok(None);
+  };
+
+  fs::write(&path, content).map_err(|err| format!("Could not save file: {err}"))?;
+  Ok(Some(path.to_string_lossy().into_owned()))
+}
+
+#[tauri::command]
+fn download_update(app: tauri::AppHandle, url: String, file_name: String) -> Result<(), String> {
+  let download_url = url.trim().to_string();
+  if download_url.is_empty() {
+    return Err("Update URL is empty.".into());
+  }
+
+  let file_name = sanitize_download_file_name(&file_name)?;
+  let download_dir = update_downloads_dir();
+  let download_path = download_dir.join(&file_name);
+
+  app.state::<AppState>().clear_pending_installer_path();
+
+  std::thread::spawn(move || {
+    let result = (|| -> Result<(), String> {
+      fs::create_dir_all(&download_dir).map_err(|err| format!("Could not create update directory: {err}"))?;
+
+      if download_path.exists() {
+        let _ = fs::remove_file(&download_path);
+      }
+
+      let response = reqwest::blocking::get(&download_url)
+        .map_err(|err| format!("Could not start update download: {err}"))?;
+
+      if !response.status().is_success() {
+        return Err(format!("Update download failed with status {}.", response.status()));
+      }
+
+      let total_bytes = response.content_length();
+      let _ = app.emit(
+        UPDATE_DOWNLOAD_STARTED_EVENT,
+        UpdateDownloadStartedPayload {
+          file_name: file_name.clone(),
+          total_bytes,
+        },
+      );
+
+      let mut response = response;
+      let mut file = fs::File::create(&download_path).map_err(|err| format!("Could not create update file: {err}"))?;
+      let mut buffer = [0u8; 64 * 1024];
+      let mut downloaded_bytes = 0u64;
+
+      loop {
+        let read = response
+          .read(&mut buffer)
+          .map_err(|err| format!("Could not read update stream: {err}"))?;
+
+        if read == 0 {
+          break;
+        }
+
+        file
+          .write_all(&buffer[..read])
+          .map_err(|err| format!("Could not write update file: {err}"))?;
+
+        downloaded_bytes += read as u64;
+
+        let progress_percent = total_bytes.map(|total| {
+          if total == 0 {
+            0.0
+          } else {
+            (downloaded_bytes as f64 / total as f64) * 100.0
+          }
+        });
+
+        let _ = app.emit(
+          UPDATE_DOWNLOAD_PROGRESS_EVENT,
+          UpdateDownloadProgressPayload {
+            file_name: file_name.clone(),
+            downloaded_bytes,
+            total_bytes,
+            progress_percent,
+          },
+        );
+      }
+
+      file.flush().map_err(|err| format!("Could not finalize update file: {err}"))?;
+
+      app
+        .state::<AppState>()
+        .set_pending_installer_path(download_path.clone());
+
+      let _ = app.emit(
+        UPDATE_DOWNLOAD_FINISHED_EVENT,
+        UpdateDownloadFinishedPayload {
+          file_name: file_name.clone(),
+          path: download_path.to_string_lossy().into_owned(),
+        },
+      );
+
+      Ok(())
+    })();
+
+    if let Err(err) = result {
+      let _ = fs::remove_file(&download_path);
+      app.state::<AppState>().clear_pending_installer_path();
+      emit_update_download_failed(&app, file_name, err);
+    }
+  });
+
+  Ok(())
+}
+
+#[tauri::command]
 fn clipboard_read_items() -> Result<Vec<ClipboardItemPayload>, String> {
   #[cfg(target_os = "windows")]
   {
@@ -956,13 +1240,15 @@ pub fn run() {
     }
   }
 
-  tauri::Builder::default()
+  let app = tauri::Builder::default()
     .manage(AppState::default())
     .invoke_handler(tauri::generate_handler![
       get_release_channel,
       get_launch_file_path,
       set_release_channel,
       write_project_file,
+      save_binary_file,
+      download_update,
       clipboard_read_items,
       clipboard_write_items
     ])
@@ -977,6 +1263,12 @@ pub fn run() {
       let context = parse_launch_context(env::args_os().skip(1).map(|arg| arg.to_string_lossy().into_owned()));
       Ok(apply_launch_context(app.handle(), context)?)
     })
-    .run(tauri::generate_context!())
-    .expect("error while running tauri application");
+    .build(tauri::generate_context!())
+    .expect("error while building tauri application");
+
+  app.run(|app_handle, event| {
+    if let tauri::RunEvent::Exit = event {
+      launch_pending_installer_if_any(app_handle);
+    }
+  });
 }

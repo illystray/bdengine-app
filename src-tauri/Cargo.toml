@@ -1,6 +1,6 @@
 [package]
 name = "bdengine_app"
-version = "1.0.2"
+version = "1.0.3"
 description = "Windows desktop shell for https://bdengine.app"
 authors = ["BDEngine"]
 license = "UNLICENSED"
@@ -17,6 +17,8 @@ tauri-build = { version = "2.5.6", features = [] }
 
 [dependencies]
 base64 = "0.22"
+image = { version = "0.25", default-features = false, features = ["png"] }
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 tauri = { version = "2.10.3", features = ["devtools", "image-png"] }
@@ -25,6 +27,7 @@ tauri-plugin-single-instance = "2"
 url = "2"
 windows = { version = "0.61.3", features = [
   "Win32_Foundation",
+  "Win32_Graphics_Gdi",
   "Win32_System_DataExchange",
   "Win32_System_Memory",
   "Win32_System_Ole"
