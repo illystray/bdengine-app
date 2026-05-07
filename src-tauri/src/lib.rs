@@ -42,7 +42,7 @@ const BETA_BASE_URL: &str = "https://beta.bdengine.app/";
 const TASKBAR_ICON_PNG: &[u8] = include_bytes!("../icons/32x32.png");
 const APP_CONFIG_FILE_NAME: &str = "config.json";
 const APP_IDENTIFIER: &str = "app.bdengine.desktop";
-const APP_VERSION: u32 = 4;
+const APP_VERSION: u32 = 5;
 const UPDATE_DOWNLOAD_STARTED_EVENT: &str = "update-download-started";
 const UPDATE_DOWNLOAD_PROGRESS_EVENT: &str = "update-download-progress";
 const UPDATE_DOWNLOAD_FINISHED_EVENT: &str = "update-download-finished";
@@ -645,7 +645,8 @@ if ('{initial_directory}' -ne '') {{
   $dialog.InitialDirectory = '{initial_directory}'
 }}
 if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {{
-  [Console]::Out.Write($dialog.FileName)
+  $bytes = [System.Text.Encoding]::UTF8.GetBytes($dialog.FileName)
+  [Console]::OpenStandardOutput().Write($bytes, 0, $bytes.Length)
 }}
 "#,
     file_name = escape_powershell_single_quoted(file_name),
