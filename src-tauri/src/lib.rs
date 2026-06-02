@@ -37,12 +37,14 @@ use windows::{
 };
 
 const MAIN_WINDOW_LABEL: &str = "main";
+const SPLASH_WINDOW_LABEL: &str = "splash";
 const STABLE_BASE_URL: &str = "https://bdengine.app/";
 const BETA_BASE_URL: &str = "https://beta.bdengine.app/";
 const TASKBAR_ICON_PNG: &[u8] = include_bytes!("../icons/32x32.png");
+const SPLASH_IMAGE_PNG: &[u8] = include_bytes!("../splash/splash.png");
 const APP_CONFIG_FILE_NAME: &str = "config.json";
 const APP_IDENTIFIER: &str = "app.bdengine.desktop";
-const APP_VERSION: u32 = 6;
+const APP_VERSION: u32 = 7;
 const UPDATE_DOWNLOAD_STARTED_EVENT: &str = "update-download-started";
 const UPDATE_DOWNLOAD_PROGRESS_EVENT: &str = "update-download-progress";
 const UPDATE_DOWNLOAD_FINISHED_EVENT: &str = "update-download-finished";
@@ -744,6 +746,10 @@ fn update_downloads_dir() -> PathBuf {
   env::temp_dir().join(APP_IDENTIFIER).join("updates")
 }
 
+fn splash_runtime_dir() -> PathBuf {
+  env::temp_dir().join(APP_IDENTIFIER).join("splash")
+}
+
 fn sanitize_download_file_name(file_name: &str) -> Result<String, String> {
   let trimmed_name = file_name.trim();
   if trimmed_name.is_empty() {
@@ -768,6 +774,7 @@ fn emit_update_download_failed(app: &tauri::AppHandle, file_name: String, error:
 #[cfg(target_os = "windows")]
 fn launch_installer(installer_path: &Path) -> Result<(), String> {
   Command::new(installer_path)
+    .args(["/SILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/SP-"])
     .spawn()
     .map_err(|err| format!("Could not launch installer: {err}"))?;
   Ok(())
@@ -948,6 +955,85 @@ fn dispatch_launch_context(window: &WebviewWindow, context: &LaunchContext) -> t
   Ok(())
 }
 
+fn build_splash_html() -> String {
+  let image_base64 = BASE64.encode(SPLASH_IMAGE_PNG);
+  format!(
+    r#"<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>BDEngine</title>
+    <style>
+      html, body {{
+        margin: 0;
+        width: 100%;
+        height: 100%;
+        overflow: hidden;
+        background: transparent;
+      }}
+      body {{
+        display: flex;
+        align-items: center;
+        justify-content: center;
+      }}
+      img {{
+        display: block;
+        width: 100%;
+        height: 100%;
+        user-select: none;
+        -webkit-user-drag: none;
+        pointer-events: none;
+      }}
+    </style>
+  </head>
+  <body>
+    <img src="data:image/png;base64,{image_base64}" alt="BDEngine splash">
+  </body>
+</html>"#
+  )
+}
+
+fn prepare_splash_html_file() -> Result<PathBuf, String> {
+  let splash_dir = splash_runtime_dir();
+  fs::create_dir_all(&splash_dir).map_err(|err| format!("Could not create splash directory: {err}"))?;
+  let splash_path = splash_dir.join("splash.html");
+  fs::write(&splash_path, build_splash_html()).map_err(|err| format!("Could not write splash html: {err}"))?;
+  Ok(splash_path)
+}
+
+fn create_splash_window(app: &tauri::AppHandle) -> tauri::Result<WebviewWindow> {
+  if let Some(window) = app.get_webview_window(SPLASH_WINDOW_LABEL) {
+    return Ok(window);
+  }
+
+  let splash_path = prepare_splash_html_file()
+    .map_err(std::io::Error::other)?;
+  let splash_url = Url::from_file_path(&splash_path)
+    .map_err(|_| std::io::Error::other("Could not convert splash path to file URL."))?;
+
+  WebviewWindowBuilder::new(
+    app,
+    SPLASH_WINDOW_LABEL,
+    WebviewUrl::External(splash_url),
+  )
+  .title("BDEngine")
+  .inner_size(600.0, 338.0)
+  .resizable(false)
+  .minimizable(false)
+  .maximizable(false)
+  .closable(false)
+  .fullscreen(false)
+  .visible(true)
+  .center()
+  .decorations(false)
+  .shadow(false)
+  .transparent(true)
+  .always_on_top(true)
+  .skip_taskbar(true)
+  .build()
+}
+
 fn create_main_window(app: &tauri::AppHandle, context: &LaunchContext) -> tauri::Result<WebviewWindow> {
   let mut config = app
     .config()
@@ -994,6 +1080,9 @@ fn create_main_window(app: &tauri::AppHandle, context: &LaunchContext) -> tauri:
         let _ = dispatch_launch_context(&window, &context);
         let _ = window.show();
         let _ = window.set_focus();
+        if let Some(splash) = app_handle.get_webview_window(SPLASH_WINDOW_LABEL) {
+          let _ = splash.close();
+        }
       }
     });
 
@@ -1020,7 +1109,7 @@ fn apply_launch_context(app: &tauri::AppHandle, context: LaunchContext) -> tauri
     return create_main_window(app, &context).map(|_| ());
   };
 
-  if !window.is_visible()? {
+  if !window.is_visible()? && app.get_webview_window(SPLASH_WINDOW_LABEL).is_none() {
     let _ = window.show();
   }
   let _ = window.set_focus();
@@ -1262,6 +1351,7 @@ pub fn run() {
       let channel = load_release_channel(app.handle());
       app.state::<AppState>().set_release_channel(channel);
       let context = parse_launch_context(env::args_os().skip(1).map(|arg| arg.to_string_lossy().into_owned()));
+      create_splash_window(app.handle())?;
       Ok(apply_launch_context(app.handle(), context)?)
     })
     .build(tauri::generate_context!())
