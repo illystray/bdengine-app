@@ -1,6 +1,6 @@
 [package]
 name = "bdengine_app"
-version = "1.0.6"
+version = "1.0.7"
 description = "Windows desktop shell for https://bdengine.app"
 authors = ["BDEngine"]
 license = "UNLICENSED"
@@ -17,6 +17,7 @@ tauri-build = { version = "2.5.6", features = [] }
 
 [dependencies]
 base64 = "0.22"
+discord-rich-presence = "1.1.0"
 image = { version = "0.25", default-features = false, features = ["png"] }
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
 serde = { version = "1.0", features = ["derive"] }

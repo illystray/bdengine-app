@@ -1,5 +1,6 @@
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
+use discord_rich_presence::{activity, DiscordIpc, DiscordIpcClient};
 use serde::{Deserialize, Serialize};
 use std::{
   env,
@@ -44,7 +45,10 @@ const TASKBAR_ICON_PNG: &[u8] = include_bytes!("../icons/32x32.png");
 const SPLASH_IMAGE_PNG: &[u8] = include_bytes!("../splash/splash.png");
 const APP_CONFIG_FILE_NAME: &str = "config.json";
 const APP_IDENTIFIER: &str = "app.bdengine.desktop";
-const APP_VERSION: u32 = 7;
+const APP_VERSION: u32 = 8;
+const DISCORD_APPLICATION_ID: &str = "1514012998455529483";
+const DISCORD_LARGE_IMAGE_KEY: &str = "bde_logo";
+const DISCORD_OPEN_URL: &str = "https://bdengine.app";
 const UPDATE_DOWNLOAD_STARTED_EVENT: &str = "update-download-started";
 const UPDATE_DOWNLOAD_PROGRESS_EVENT: &str = "update-download-progress";
 const UPDATE_DOWNLOAD_FINISHED_EVENT: &str = "update-download-finished";
@@ -135,6 +139,15 @@ struct UpdateDownloadFailedPayload {
   error: String,
 }
 
+#[derive(Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DiscordPresencePayload {
+  mode: String,
+  party_id: Option<String>,
+  current_size: Option<i32>,
+  max_size: Option<i32>,
+}
+
 #[derive(Clone, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct LaunchContext {
@@ -170,6 +183,7 @@ struct AppState {
   launch_context: Mutex<LaunchContext>,
   release_channel: Mutex<ReleaseChannel>,
   pending_installer_path: Mutex<Option<PathBuf>>,
+  discord_client: Mutex<Option<DiscordIpcClient>>,
 }
 
 impl AppState {
@@ -209,6 +223,56 @@ impl AppState {
       .lock()
       .expect("pending installer state poisoned")
       .take()
+  }
+
+  fn with_discord_client<F>(&self, mut action: F) -> Result<(), String>
+  where
+    F: FnMut(&mut DiscordIpcClient) -> Result<(), String>,
+  {
+    let mut guard = self
+      .discord_client
+      .lock()
+      .expect("discord presence state poisoned");
+
+    if guard.is_none() {
+      let mut client = DiscordIpcClient::new(DISCORD_APPLICATION_ID);
+      if client.connect().is_err() {
+        return Ok(());
+      }
+      *guard = Some(client);
+    }
+
+    let client = guard.as_mut().expect("discord client must be initialized");
+    if action(client).is_err() {
+      let mut client = DiscordIpcClient::new(DISCORD_APPLICATION_ID);
+      if client.connect().is_err() {
+        *guard = None;
+        return Ok(());
+      }
+
+      if action(&mut client).is_err() {
+        *guard = None;
+        return Ok(());
+      }
+
+      *guard = Some(client);
+    }
+
+    Ok(())
+  }
+
+  fn clear_discord_client(&self) {
+    let mut guard = self
+      .discord_client
+      .lock()
+      .expect("discord presence state poisoned");
+
+    if let Some(client) = guard.as_mut() {
+      let _ = client.clear_activity();
+      let _ = client.close();
+    }
+
+    *guard = None;
   }
 }
 
@@ -807,6 +871,47 @@ fn launch_pending_installer_if_any(app: &tauri::AppHandle) {
   }
 }
 
+fn close_discord_presence_if_any(app: &tauri::AppHandle) {
+  app.state::<AppState>().clear_discord_client();
+}
+
+fn discord_presence_details(mode: &str) -> Option<&'static str> {
+  match mode {
+    "editing" => Some("Editing a project"),
+    "animating" => Some("Animating a model"),
+    "sound" => Some("Creating sound effects"),
+    "painting" => Some("Painting textures"),
+    "share_party" => Some("In a Share Party"),
+    _ => None,
+  }
+}
+
+fn build_discord_activity(payload: &DiscordPresencePayload) -> Result<activity::Activity<'static>, String> {
+  let details = discord_presence_details(payload.mode.trim())
+    .ok_or_else(|| format!("Unsupported Discord presence mode: {}", payload.mode))?;
+
+  let mut activity = activity::Activity::new()
+    .details(details)
+    .assets(
+      activity::Assets::new()
+        .large_image(DISCORD_LARGE_IMAGE_KEY)
+        .large_text("BDEngine"),
+    )
+    .buttons(vec![activity::Button::new("Open BDEngine", DISCORD_OPEN_URL)]);
+
+  if payload.mode.trim() == "share_party" {
+    let current_size = payload.current_size.unwrap_or(0).max(0);
+    let max_size = payload.max_size.unwrap_or(0).max(current_size);
+    activity = activity.state(format!("{current_size}/{max_size} users connected"));
+
+    if let Some(party_id) = payload.party_id.as_deref().filter(|value| !value.trim().is_empty()) {
+      activity = activity.party(activity::Party::new().id(party_id.to_string()).size([current_size, max_size]));
+    }
+  }
+
+  Ok(activity)
+}
+
 fn parse_launch_context<I, S>(args: I) -> LaunchContext
 where
   I: IntoIterator<Item = S>,
@@ -1172,6 +1277,34 @@ fn save_binary_file(file_name: String, content: Vec<u8>) -> Result<Option<String
 }
 
 #[tauri::command]
+fn set_discord_presence(
+  state: tauri::State<'_, AppState>,
+  mode: String,
+  party_id: Option<String>,
+  current_size: Option<i32>,
+  max_size: Option<i32>,
+) -> Result<(), String> {
+  let payload = DiscordPresencePayload {
+    mode,
+    party_id,
+    current_size,
+    max_size,
+  };
+  let activity = build_discord_activity(&payload)?;
+  state.with_discord_client(|client| {
+    client
+      .set_activity(activity.clone())
+      .map_err(|err| format!("Could not set Discord activity: {err}"))
+  })
+}
+
+#[tauri::command]
+fn clear_discord_presence(state: tauri::State<'_, AppState>) -> Result<(), String> {
+  state.clear_discord_client();
+  Ok(())
+}
+
+#[tauri::command]
 fn download_update(app: tauri::AppHandle, url: String, file_name: String) -> Result<(), String> {
   let download_url = url.trim().to_string();
   if download_url.is_empty() {
@@ -1338,6 +1471,8 @@ pub fn run() {
       set_release_channel,
       write_project_file,
       save_binary_file,
+      set_discord_presence,
+      clear_discord_presence,
       download_update,
       clipboard_read_items,
       clipboard_write_items
@@ -1359,6 +1494,7 @@ pub fn run() {
 
   app.run(|app_handle, event| {
     if let tauri::RunEvent::Exit = event {
+      close_discord_presence_if_any(app_handle);
       launch_pending_installer_if_any(app_handle);
     }
   });
