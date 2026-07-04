@@ -1,6 +1,6 @@
 [package]
 name = "bdengine_app"
-version = "1.0.10"
+version = "1.0.11"
 description = "Windows desktop shell for https://bdengine.app"
 authors = ["BDEngine"]
 license = "UNLICENSED"

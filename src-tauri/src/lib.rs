@@ -50,7 +50,7 @@ const TASKBAR_ICON_PNG: &[u8] = include_bytes!("../icons/32x32.png");
 const SPLASH_IMAGE_PNG: &[u8] = include_bytes!("../splash/splash.png");
 const APP_CONFIG_FILE_NAME: &str = "config.json";
 const APP_IDENTIFIER: &str = "app.bdengine.desktop";
-const APP_VERSION: u32 = 10;
+const APP_VERSION: u32 = 11;
 const DISCORD_APPLICATION_ID: &str = "1514012998455529483";
 const DISCORD_LARGE_IMAGE_KEY: &str = "bde_logo";
 const DISCORD_OPEN_URL: &str = "https://bdengine.app";
@@ -1232,11 +1232,11 @@ fn create_main_window(app: &tauri::AppHandle, context: &LaunchContext) -> tauri:
 
 fn apply_launch_context(app: &tauri::AppHandle, context: LaunchContext) -> tauri::Result<()> {
   let state = app.state::<AppState>();
-  state.set_launch_context(context.clone());
 
   let window = if let Some(window) = app.get_webview_window(MAIN_WINDOW_LABEL) {
     window
   } else {
+    state.set_launch_context(context.clone());
     return create_main_window(app, &context).map(|_| ());
   };
 
@@ -1245,7 +1245,13 @@ fn apply_launch_context(app: &tauri::AppHandle, context: LaunchContext) -> tauri
   }
   let _ = window.set_focus();
 
-  dispatch_launch_context(&window, &context)?;
+  match dispatch_launch_context(&window, &context) {
+    Ok(()) => state.set_launch_context(LaunchContext::default()),
+    Err(err) => {
+      state.set_launch_context(context);
+      return Err(err);
+    }
+  }
 
   Ok(())
 }
@@ -1286,8 +1292,10 @@ fn app_ready_for_launch_context(
   };
 
   let context = state.take_launch_context();
-  dispatch_launch_context(&window, &context)
-    .map_err(|err| format!("Could not dispatch launch context: {err}"))?;
+  if let Err(err) = dispatch_launch_context(&window, &context) {
+    state.set_launch_context(context);
+    return Err(format!("Could not dispatch launch context: {err}"));
+  }
 
   let _ = window.show();
   let _ = window.set_focus();
