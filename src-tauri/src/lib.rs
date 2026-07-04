@@ -50,7 +50,7 @@ const TASKBAR_ICON_PNG: &[u8] = include_bytes!("../icons/32x32.png");
 const SPLASH_IMAGE_PNG: &[u8] = include_bytes!("../splash/splash.png");
 const APP_CONFIG_FILE_NAME: &str = "config.json";
 const APP_IDENTIFIER: &str = "app.bdengine.desktop";
-const APP_VERSION: u32 = 9;
+const APP_VERSION: u32 = 10;
 const DISCORD_APPLICATION_ID: &str = "1514012998455529483";
 const DISCORD_LARGE_IMAGE_KEY: &str = "bde_logo";
 const DISCORD_OPEN_URL: &str = "https://bdengine.app";
@@ -195,6 +195,10 @@ struct AppState {
 impl AppState {
   fn get_launch_context(&self) -> LaunchContext {
     self.launch_context.lock().expect("launch state poisoned").clone()
+  }
+
+  fn take_launch_context(&self) -> LaunchContext {
+    mem::take(&mut *self.launch_context.lock().expect("launch state poisoned"))
   }
 
   fn set_launch_context(&self, context: LaunchContext) {
@@ -1281,7 +1285,7 @@ fn app_ready_for_launch_context(
     return Err("Main window is not available.".into());
   };
 
-  let context = state.get_launch_context();
+  let context = state.take_launch_context();
   dispatch_launch_context(&window, &context)
     .map_err(|err| format!("Could not dispatch launch context: {err}"))?;
 
