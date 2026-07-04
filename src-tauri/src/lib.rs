@@ -10,7 +10,12 @@ use std::{
   path::{Path, PathBuf},
   process::{Command, Stdio},
   slice,
-  sync::Mutex,
+  sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc, Mutex,
+  },
+  thread,
+  time::Duration,
 };
 #[cfg(target_os = "windows")]
 use std::os::windows::process::CommandExt;
@@ -45,10 +50,11 @@ const TASKBAR_ICON_PNG: &[u8] = include_bytes!("../icons/32x32.png");
 const SPLASH_IMAGE_PNG: &[u8] = include_bytes!("../splash/splash.png");
 const APP_CONFIG_FILE_NAME: &str = "config.json";
 const APP_IDENTIFIER: &str = "app.bdengine.desktop";
-const APP_VERSION: u32 = 8;
+const APP_VERSION: u32 = 9;
 const DISCORD_APPLICATION_ID: &str = "1514012998455529483";
 const DISCORD_LARGE_IMAGE_KEY: &str = "bde_logo";
 const DISCORD_OPEN_URL: &str = "https://bdengine.app";
+const MAIN_WINDOW_REVEAL_TIMEOUT_MS: u64 = 4_000;
 const UPDATE_DOWNLOAD_STARTED_EVENT: &str = "update-download-started";
 const UPDATE_DOWNLOAD_PROGRESS_EVENT: &str = "update-download-progress";
 const UPDATE_DOWNLOAD_FINISHED_EVENT: &str = "update-download-finished";
@@ -1139,6 +1145,19 @@ fn create_splash_window(app: &tauri::AppHandle) -> tauri::Result<WebviewWindow> 
   .build()
 }
 
+fn reveal_main_window(app: &tauri::AppHandle, window: &WebviewWindow, is_revealed: &AtomicBool) {
+  if is_revealed.swap(true, Ordering::SeqCst) {
+    return;
+  }
+
+  let _ = window.show();
+  let _ = window.set_focus();
+
+  if let Some(splash) = app.get_webview_window(SPLASH_WINDOW_LABEL) {
+    let _ = splash.close();
+  }
+}
+
 fn create_main_window(app: &tauri::AppHandle, context: &LaunchContext) -> tauri::Result<WebviewWindow> {
   let mut config = app
     .config()
@@ -1151,6 +1170,8 @@ fn create_main_window(app: &tauri::AppHandle, context: &LaunchContext) -> tauri:
   config.url = WebviewUrl::External(build_remote_url(context, channel));
 
   let app_handle = app.clone();
+  let is_revealed = Arc::new(AtomicBool::new(false));
+  let page_load_revealed = Arc::clone(&is_revealed);
 
   let mut builder = WebviewWindowBuilder::from_config(app, &config)?
     .visible(false)
@@ -1180,14 +1201,7 @@ fn create_main_window(app: &tauri::AppHandle, context: &LaunchContext) -> tauri:
     })
     .on_page_load(move |window, payload| {
       if matches!(payload.event(), PageLoadEvent::Finished) {
-        let state = app_handle.state::<AppState>();
-        let context = state.get_launch_context();
-        let _ = dispatch_launch_context(&window, &context);
-        let _ = window.show();
-        let _ = window.set_focus();
-        if let Some(splash) = app_handle.get_webview_window(SPLASH_WINDOW_LABEL) {
-          let _ = splash.close();
-        }
+        reveal_main_window(&app_handle, &window, &page_load_revealed);
       }
     });
 
@@ -1200,6 +1214,14 @@ fn create_main_window(app: &tauri::AppHandle, context: &LaunchContext) -> tauri:
   if let Some(icon) = taskbar_icon() {
     let _ = window.set_icon(icon);
   }
+
+  let timeout_app = app.clone();
+  let timeout_window = window.clone();
+  let timeout_revealed = Arc::clone(&is_revealed);
+  thread::spawn(move || {
+    thread::sleep(Duration::from_millis(MAIN_WINDOW_REVEAL_TIMEOUT_MS));
+    reveal_main_window(&timeout_app, &timeout_window, &timeout_revealed);
+  });
 
   Ok(window)
 }
@@ -1248,6 +1270,29 @@ fn set_release_channel(
   persist_release_channel(&app, channel)?;
   state.set_release_channel(channel);
   Ok(channel.as_str().to_string())
+}
+
+#[tauri::command]
+fn app_ready_for_launch_context(
+  app: tauri::AppHandle,
+  state: tauri::State<'_, AppState>,
+) -> Result<(), String> {
+  let Some(window) = app.get_webview_window(MAIN_WINDOW_LABEL) else {
+    return Err("Main window is not available.".into());
+  };
+
+  let context = state.get_launch_context();
+  dispatch_launch_context(&window, &context)
+    .map_err(|err| format!("Could not dispatch launch context: {err}"))?;
+
+  let _ = window.show();
+  let _ = window.set_focus();
+
+  if let Some(splash) = app.get_webview_window(SPLASH_WINDOW_LABEL) {
+    let _ = splash.close();
+  }
+
+  Ok(())
 }
 
 #[tauri::command]
@@ -1469,6 +1514,7 @@ pub fn run() {
       get_release_channel,
       get_launch_file_path,
       set_release_channel,
+      app_ready_for_launch_context,
       write_project_file,
       save_binary_file,
       set_discord_presence,
