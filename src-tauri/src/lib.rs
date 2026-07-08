@@ -1,12 +1,17 @@
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
 use discord_rich_presence::{activity, DiscordIpc, DiscordIpcClient};
+use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
+use socket2::{Domain, Protocol, Socket, Type};
+#[cfg(target_os = "windows")]
+use std::os::windows::process::CommandExt;
 use std::{
-  env,
-  fs,
+  collections::{HashMap, HashSet},
+  env, fs,
   io::{Read, Write},
   mem,
+  net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4},
   path::{Path, PathBuf},
   process::{Command, Stdio},
   slice,
@@ -17,14 +22,26 @@ use std::{
   thread,
   time::Duration,
 };
-#[cfg(target_os = "windows")]
-use std::os::windows::process::CommandExt;
 use tauri::{
   image::Image,
   webview::{DownloadEvent, NewWindowResponse, PageLoadEvent},
   Emitter, Manager, WebviewUrl, WebviewWindow, WebviewWindowBuilder,
 };
+use tokio::{
+  io::{AsyncReadExt, AsyncWriteExt},
+  net::{lookup_host, TcpListener, TcpStream, UdpSocket},
+  sync::watch,
+  time::{timeout, Instant},
+};
+use tokio_tungstenite::{
+  accept_hdr_async,
+  tungstenite::{
+    handshake::server::{ErrorResponse, Request, Response},
+    Message,
+  },
+};
 use url::Url;
+use uuid::Uuid;
 #[cfg(target_os = "windows")]
 use windows::{
   core::{w, PCWSTR},
@@ -32,8 +49,8 @@ use windows::{
     Foundation::{HANDLE, HGLOBAL, HWND},
     System::{
       DataExchange::{
-        CloseClipboard, EmptyClipboard, GetClipboardData, IsClipboardFormatAvailable, OpenClipboard,
-        RegisterClipboardFormatW, SetClipboardData,
+        CloseClipboard, EmptyClipboard, GetClipboardData, IsClipboardFormatAvailable,
+        OpenClipboard, RegisterClipboardFormatW, SetClipboardData,
       },
       Memory::{GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock, GMEM_MOVEABLE},
       Ole::CF_UNICODETEXT,
@@ -50,7 +67,7 @@ const TASKBAR_ICON_PNG: &[u8] = include_bytes!("../icons/32x32.png");
 const SPLASH_IMAGE_PNG: &[u8] = include_bytes!("../splash/splash.png");
 const APP_CONFIG_FILE_NAME: &str = "config.json";
 const APP_IDENTIFIER: &str = "app.bdengine.desktop";
-const APP_VERSION: u32 = 11;
+const APP_VERSION: u32 = 13;
 const DISCORD_APPLICATION_ID: &str = "1514012998455529483";
 const DISCORD_LARGE_IMAGE_KEY: &str = "bde_logo";
 const DISCORD_OPEN_URL: &str = "https://bdengine.app";
@@ -59,6 +76,18 @@ const UPDATE_DOWNLOAD_STARTED_EVENT: &str = "update-download-started";
 const UPDATE_DOWNLOAD_PROGRESS_EVENT: &str = "update-download-progress";
 const UPDATE_DOWNLOAD_FINISHED_EVENT: &str = "update-download-finished";
 const UPDATE_DOWNLOAD_FAILED_EVENT: &str = "update-download-failed";
+const MINECRAFT_PROXY_DEFAULT_PORT: u32 = 25565;
+const MINECRAFT_PROXY_PATH_PREFIX: &str = "/minecraft/";
+const MINECRAFT_PROXY_READ_BUFFER_BYTES: usize = 64 * 1024;
+const MINECRAFT_PROXY_STARTED_EVENT: &str = "minecraft-proxy-started";
+const MINECRAFT_PROXY_STOPPED_EVENT: &str = "minecraft-proxy-stopped";
+const MINECRAFT_PROXY_CONNECTED_EVENT: &str = "minecraft-proxy-connected";
+const MINECRAFT_PROXY_DISCONNECTED_EVENT: &str = "minecraft-proxy-disconnected";
+const MINECRAFT_PROXY_ERROR_EVENT: &str = "minecraft-proxy-error";
+const MINECRAFT_LAN_MULTICAST_ADDR: Ipv4Addr = Ipv4Addr::new(224, 0, 2, 60);
+const MINECRAFT_LAN_MULTICAST_PORT: u16 = 4445;
+const MINECRAFT_LAN_DISCOVERY_DEFAULT_TIMEOUT_MS: u64 = 3_000;
+const MINECRAFT_LAN_PACKET_MAX_BYTES: usize = 2_048;
 #[cfg(target_os = "windows")]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 #[cfg(target_os = "windows")]
@@ -145,6 +174,45 @@ struct UpdateDownloadFailedPayload {
   error: String,
 }
 
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct MinecraftProxyStartPayload {
+  proxy_id: String,
+  ws_url: String,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct MinecraftProxyInfo {
+  proxy_id: String,
+  host: String,
+  port: u16,
+  ws_url: String,
+  connected: bool,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct MinecraftProxyStatusPayload {
+  running: bool,
+  proxies: Vec<MinecraftProxyInfo>,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct MinecraftProxyErrorPayload {
+  proxy_id: String,
+  error: String,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct MinecraftLanServerPayload {
+  host: String,
+  port: u16,
+  motd: String,
+}
+
 #[derive(Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct DiscordPresencePayload {
@@ -184,17 +252,43 @@ struct LaunchFile {
   base64: String,
 }
 
+struct MinecraftProxyHandle {
+  proxy_id: String,
+  host: String,
+  port: u16,
+  ws_url: String,
+  connected: Arc<AtomicBool>,
+  shutdown_tx: watch::Sender<bool>,
+}
+
+impl MinecraftProxyHandle {
+  fn info(&self) -> MinecraftProxyInfo {
+    MinecraftProxyInfo {
+      proxy_id: self.proxy_id.clone(),
+      host: self.host.clone(),
+      port: self.port,
+      ws_url: self.ws_url.clone(),
+      connected: self.connected.load(Ordering::SeqCst),
+    }
+  }
+}
+
 #[derive(Default)]
 struct AppState {
   launch_context: Mutex<LaunchContext>,
   release_channel: Mutex<ReleaseChannel>,
   pending_installer_path: Mutex<Option<PathBuf>>,
   discord_client: Mutex<Option<DiscordIpcClient>>,
+  minecraft_proxies: Mutex<HashMap<String, MinecraftProxyHandle>>,
 }
 
 impl AppState {
   fn get_launch_context(&self) -> LaunchContext {
-    self.launch_context.lock().expect("launch state poisoned").clone()
+    self
+      .launch_context
+      .lock()
+      .expect("launch state poisoned")
+      .clone()
   }
 
   fn take_launch_context(&self) -> LaunchContext {
@@ -206,11 +300,17 @@ impl AppState {
   }
 
   fn get_release_channel(&self) -> ReleaseChannel {
-    *self.release_channel.lock().expect("release channel state poisoned")
+    *self
+      .release_channel
+      .lock()
+      .expect("release channel state poisoned")
   }
 
   fn set_release_channel(&self, channel: ReleaseChannel) {
-    *self.release_channel.lock().expect("release channel state poisoned") = channel;
+    *self
+      .release_channel
+      .lock()
+      .expect("release channel state poisoned") = channel;
   }
 
   fn set_pending_installer_path(&self, path: PathBuf) {
@@ -284,6 +384,47 @@ impl AppState {
 
     *guard = None;
   }
+
+  fn insert_minecraft_proxy(&self, proxy: MinecraftProxyHandle) {
+    self
+      .minecraft_proxies
+      .lock()
+      .expect("minecraft proxy state poisoned")
+      .insert(proxy.proxy_id.clone(), proxy);
+  }
+
+  fn remove_minecraft_proxy(&self, proxy_id: &str) -> Option<MinecraftProxyHandle> {
+    self
+      .minecraft_proxies
+      .lock()
+      .expect("minecraft proxy state poisoned")
+      .remove(proxy_id)
+  }
+
+  fn minecraft_proxy_status(&self) -> MinecraftProxyStatusPayload {
+    let proxies: Vec<MinecraftProxyInfo> = self
+      .minecraft_proxies
+      .lock()
+      .expect("minecraft proxy state poisoned")
+      .values()
+      .map(MinecraftProxyHandle::info)
+      .collect();
+
+    MinecraftProxyStatusPayload {
+      running: !proxies.is_empty(),
+      proxies,
+    }
+  }
+
+  fn take_minecraft_proxies(&self) -> Vec<MinecraftProxyHandle> {
+    self
+      .minecraft_proxies
+      .lock()
+      .expect("minecraft proxy state poisoned")
+      .drain()
+      .map(|(_, proxy)| proxy)
+      .collect()
+  }
 }
 
 fn is_bdengine_file(path: &Path) -> bool {
@@ -304,7 +445,8 @@ fn is_supported_launch_url(url: &Url) -> bool {
 }
 
 fn is_embedded_app_url(url: &Url) -> bool {
-  matches!(url.scheme(), "https") && matches!(url.domain(), Some("bdengine.app" | "beta.bdengine.app"))
+  matches!(url.scheme(), "https")
+    && matches!(url.domain(), Some("bdengine.app" | "beta.bdengine.app"))
 }
 
 fn open_url_in_system_browser(url: &Url) -> bool {
@@ -337,7 +479,8 @@ fn webview2_installer_candidates() -> &'static [&'static str] {
 
 #[cfg(target_os = "windows")]
 fn relaunch_current_executable() -> Result<(), String> {
-  let current_exe = env::current_exe().map_err(|err| format!("Could not resolve current executable: {err}"))?;
+  let current_exe =
+    env::current_exe().map_err(|err| format!("Could not resolve current executable: {err}"))?;
   let mut command = Command::new(current_exe);
   command
     .args(env::args_os().skip(1))
@@ -367,9 +510,18 @@ fn show_native_error_message(title: &str, message: &str) {
 #[cfg(target_os = "windows")]
 fn get_webview2_runtime_version() -> Option<String> {
   let query_targets = [
-    format!(r"HKCU\Software\Microsoft\EdgeUpdate\Clients\{}", WEBVIEW2_CLIENT_GUID),
-    format!(r"HKLM\Software\Microsoft\EdgeUpdate\Clients\{}", WEBVIEW2_CLIENT_GUID),
-    format!(r"HKLM\Software\WOW6432Node\Microsoft\EdgeUpdate\Clients\{}", WEBVIEW2_CLIENT_GUID),
+    format!(
+      r"HKCU\Software\Microsoft\EdgeUpdate\Clients\{}",
+      WEBVIEW2_CLIENT_GUID
+    ),
+    format!(
+      r"HKLM\Software\Microsoft\EdgeUpdate\Clients\{}",
+      WEBVIEW2_CLIENT_GUID
+    ),
+    format!(
+      r"HKLM\Software\WOW6432Node\Microsoft\EdgeUpdate\Clients\{}",
+      WEBVIEW2_CLIENT_GUID
+    ),
   ];
 
   for key in query_targets {
@@ -386,7 +538,12 @@ fn get_webview2_runtime_version() -> Option<String> {
     let stdout = String::from_utf8_lossy(&output.stdout);
     for line in stdout.lines() {
       if line.contains("REG_SZ") {
-        let value = line.split_whitespace().last().unwrap_or_default().trim().to_string();
+        let value = line
+          .split_whitespace()
+          .last()
+          .unwrap_or_default()
+          .trim()
+          .to_string();
         if !value.is_empty() {
           return Some(value);
         }
@@ -412,8 +569,8 @@ fn ensure_webview2_runtime() -> Result<bool, String> {
     return Ok(false);
   }
 
-  let installer_path =
-    resolve_webview2_installer_path().ok_or_else(|| "WebView2 Runtime is missing and no bundled installer was found.".to_string())?;
+  let installer_path = resolve_webview2_installer_path()
+    .ok_or_else(|| "WebView2 Runtime is missing and no bundled installer was found.".to_string())?;
 
   let status = Command::new(&installer_path)
     .args(["/silent", "/install"])
@@ -422,7 +579,10 @@ fn ensure_webview2_runtime() -> Result<bool, String> {
     .map_err(|err| format!("Could not launch bundled WebView2 installer: {err}"))?;
 
   if !status.success() {
-    return Err(format!("Bundled WebView2 installer exited with code {:?}.", status.code()));
+    return Err(format!(
+      "Bundled WebView2 installer exited with code {:?}.",
+      status.code()
+    ));
   }
 
   if get_webview2_runtime_version().is_none() {
@@ -544,7 +704,8 @@ fn read_clipboard_png_base64() -> Option<String> {
 #[cfg(target_os = "windows")]
 fn alloc_global_handle(bytes: &[u8]) -> Result<HANDLE, String> {
   unsafe {
-    let hglobal = GlobalAlloc(GMEM_MOVEABLE, bytes.len()).map_err(|err| format!("GlobalAlloc failed: {err}"))?;
+    let hglobal = GlobalAlloc(GMEM_MOVEABLE, bytes.len())
+      .map_err(|err| format!("GlobalAlloc failed: {err}"))?;
     let ptr = GlobalLock(hglobal);
     if ptr.is_null() {
       return Err("GlobalLock failed.".into());
@@ -561,7 +722,11 @@ fn set_clipboard_text(text: &str) -> Result<(), String> {
   let mut utf16: Vec<u16> = text.encode_utf16().collect();
   utf16.push(0);
   let bytes = unsafe {
-    slice::from_raw_parts(utf16.as_ptr() as *const u8, mem::size_of_val(utf16.as_slice())).to_vec()
+    slice::from_raw_parts(
+      utf16.as_ptr() as *const u8,
+      mem::size_of_val(utf16.as_slice()),
+    )
+    .to_vec()
   };
   let handle = alloc_global_handle(&bytes)?;
   unsafe {
@@ -575,7 +740,8 @@ fn set_clipboard_text(text: &str) -> Result<(), String> {
 fn set_clipboard_registered_bytes(format: u32, bytes: &[u8]) -> Result<(), String> {
   let handle = alloc_global_handle(bytes)?;
   unsafe {
-    SetClipboardData(format, Some(handle)).map_err(|err| format!("SetClipboardData failed: {err}"))?;
+    SetClipboardData(format, Some(handle))
+      .map_err(|err| format!("SetClipboardData failed: {err}"))?;
   }
   Ok(())
 }
@@ -730,7 +896,14 @@ if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {{
   );
 
   let output = Command::new("powershell")
-    .args(["-NoProfile", "-STA", "-WindowStyle", "Hidden", "-Command", &script])
+    .args([
+      "-NoProfile",
+      "-STA",
+      "-WindowStyle",
+      "Hidden",
+      "-Command",
+      &script,
+    ])
     .creation_flags(CREATE_NO_WINDOW)
     .output()
     .ok()?;
@@ -766,11 +939,17 @@ fn load_launch_file(path: &Path) -> Option<LaunchFile> {
 
 #[cfg(target_os = "windows")]
 fn early_app_config_path() -> Option<PathBuf> {
-  env::var_os("APPDATA").map(PathBuf::from).map(|dir| dir.join(APP_IDENTIFIER).join(APP_CONFIG_FILE_NAME))
+  env::var_os("APPDATA")
+    .map(PathBuf::from)
+    .map(|dir| dir.join(APP_IDENTIFIER).join(APP_CONFIG_FILE_NAME))
 }
 
 fn app_config_path(app: &tauri::AppHandle) -> Option<PathBuf> {
-  app.path().app_config_dir().ok().map(|dir| dir.join(APP_CONFIG_FILE_NAME))
+  app
+    .path()
+    .app_config_dir()
+    .ok()
+    .map(|dir| dir.join(APP_CONFIG_FILE_NAME))
 }
 
 fn load_app_config_from_path(path: &Path) -> AppConfig {
@@ -785,8 +964,10 @@ fn save_app_config_to_path(path: &Path, config: &AppConfig) -> Result<(), String
     return Err("Could not resolve app config directory.".into());
   };
 
-  fs::create_dir_all(parent).map_err(|err| format!("Could not create app config directory: {err}"))?;
-  let contents = serde_json::to_vec_pretty(config).map_err(|err| format!("Could not serialize app config: {err}"))?;
+  fs::create_dir_all(parent)
+    .map_err(|err| format!("Could not create app config directory: {err}"))?;
+  let contents = serde_json::to_vec_pretty(config)
+    .map_err(|err| format!("Could not serialize app config: {err}"))?;
   fs::write(path, contents).map_err(|err| format!("Could not save app config: {err}"))
 }
 
@@ -813,7 +994,9 @@ fn persist_release_channel(app: &tauri::AppHandle, channel: ReleaseChannel) -> R
 }
 
 fn taskbar_icon() -> Option<Image<'static>> {
-  Image::from_bytes(TASKBAR_ICON_PNG).ok().map(|icon| icon.to_owned())
+  Image::from_bytes(TASKBAR_ICON_PNG)
+    .ok()
+    .map(|icon| icon.to_owned())
 }
 
 fn update_downloads_dir() -> PathBuf {
@@ -885,6 +1068,383 @@ fn close_discord_presence_if_any(app: &tauri::AppHandle) {
   app.state::<AppState>().clear_discord_client();
 }
 
+fn emit_minecraft_proxy_info(app: &tauri::AppHandle, event: &str, info: MinecraftProxyInfo) {
+  let _ = app.emit(event, info);
+}
+
+fn emit_minecraft_proxy_error(app: &tauri::AppHandle, proxy_id: &str, error: impl Into<String>) {
+  let _ = app.emit(
+    MINECRAFT_PROXY_ERROR_EVENT,
+    MinecraftProxyErrorPayload {
+      proxy_id: proxy_id.to_string(),
+      error: error.into(),
+    },
+  );
+}
+
+fn validate_minecraft_proxy_ip(ip: IpAddr) -> Result<(), String> {
+  match ip {
+    IpAddr::V4(ip) => {
+      if ip == Ipv4Addr::new(169, 254, 169, 254) {
+        return Err("Minecraft proxy target cannot be the metadata service address.".into());
+      }
+
+      if ip.is_unspecified() || ip.is_broadcast() || ip.is_multicast() || ip.is_link_local() {
+        return Err(format!(
+          "Minecraft proxy target address is not allowed: {ip}"
+        ));
+      }
+    }
+    IpAddr::V6(ip) => {
+      if ip.is_unspecified() || ip.is_multicast() || ip.is_unicast_link_local() {
+        return Err(format!(
+          "Minecraft proxy target address is not allowed: {ip}"
+        ));
+      }
+    }
+  }
+
+  Ok(())
+}
+
+fn is_valid_minecraft_proxy_domain(host: &str) -> bool {
+  if host.len() > 253 || host.starts_with('.') || host.ends_with('.') {
+    return false;
+  }
+
+  host.split('.').all(|part| {
+    !part.is_empty()
+      && part
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || ch == '-')
+  })
+}
+
+async fn validate_minecraft_proxy_target(
+  host: &str,
+  port: u32,
+) -> Result<(String, Vec<SocketAddr>), String> {
+  let host = host.trim();
+  if host.is_empty() {
+    return Err("Minecraft proxy host is empty.".into());
+  }
+
+  if !(1..=65535).contains(&port) {
+    return Err("Minecraft proxy port must be in range 1-65535.".into());
+  }
+  let port = port as u16;
+
+  if host.chars().any(char::is_control) || host.contains('/') || host.contains('\\') {
+    return Err("Minecraft proxy host contains unsupported characters.".into());
+  }
+
+  if host.eq_ignore_ascii_case("localhost") {
+    return Ok((
+      "localhost".into(),
+      vec![SocketAddr::from((Ipv4Addr::new(127, 0, 0, 1), port))],
+    ));
+  }
+
+  if let Ok(ip) = host.parse::<IpAddr>() {
+    validate_minecraft_proxy_ip(ip)?;
+    return Ok((host.to_string(), vec![SocketAddr::new(ip, port)]));
+  }
+
+  if !is_valid_minecraft_proxy_domain(host) {
+    return Err("Minecraft proxy host must be a valid domain or IP address.".into());
+  }
+
+  let addresses: Vec<SocketAddr> = lookup_host((host, port))
+    .await
+    .map_err(|err| format!("Could not resolve Minecraft proxy host: {err}"))?
+    .collect();
+
+  if addresses.is_empty() {
+    return Err("Minecraft proxy host did not resolve to any address.".into());
+  }
+
+  for address in &addresses {
+    validate_minecraft_proxy_ip(address.ip())?;
+  }
+
+  Ok((host.to_string(), addresses))
+}
+
+fn create_minecraft_lan_discovery_socket() -> Result<UdpSocket, String> {
+  let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))
+    .map_err(|err| format!("Could not create Minecraft LAN discovery socket: {err}"))?;
+
+  socket
+    .set_reuse_address(true)
+    .map_err(|err| format!("Could not configure Minecraft LAN discovery socket: {err}"))?;
+
+  let bind_addr = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, MINECRAFT_LAN_MULTICAST_PORT);
+  socket
+    .bind(&SocketAddr::from(bind_addr).into())
+    .map_err(|err| format!("Could not bind Minecraft LAN discovery socket: {err}"))?;
+
+  socket
+    .join_multicast_v4(&MINECRAFT_LAN_MULTICAST_ADDR, &Ipv4Addr::UNSPECIFIED)
+    .map_err(|err| format!("Could not join Minecraft LAN multicast group: {err}"))?;
+
+  socket
+    .set_nonblocking(true)
+    .map_err(|err| format!("Could not configure Minecraft LAN discovery socket mode: {err}"))?;
+
+  let std_socket: std::net::UdpSocket = socket.into();
+  UdpSocket::from_std(std_socket)
+    .map_err(|err| format!("Could not create async Minecraft LAN discovery socket: {err}"))
+}
+
+fn extract_minecraft_lan_tag<'a>(
+  message: &'a str,
+  open_tag: &str,
+  close_tag: &str,
+) -> Option<&'a str> {
+  let start = message.find(open_tag)? + open_tag.len();
+  let end = message[start..].find(close_tag)? + start;
+  Some(&message[start..end])
+}
+
+fn parse_minecraft_lan_announcement(
+  message: &str,
+  sender: SocketAddr,
+) -> Option<MinecraftLanServerPayload> {
+  let motd = extract_minecraft_lan_tag(message, "[MOTD]", "[/MOTD]")?;
+  let port = extract_minecraft_lan_tag(message, "[AD]", "[/AD]")?
+    .trim()
+    .parse::<u16>()
+    .ok()?;
+
+  if port == 0 {
+    return None;
+  }
+
+  Some(MinecraftLanServerPayload {
+    host: sender.ip().to_string(),
+    port,
+    motd: motd.to_string(),
+  })
+}
+
+fn is_allowed_minecraft_proxy_origin(origin: &str) -> bool {
+  let Ok(url) = Url::parse(origin) else {
+    return false;
+  };
+
+  match (url.scheme(), url.host_str()) {
+    ("https", Some("bdengine.app" | "beta.bdengine.app")) => true,
+    ("http" | "https", Some("localhost" | "127.0.0.1")) => true,
+    _ => false,
+  }
+}
+
+fn minecraft_proxy_handshake_error(message: &str) -> ErrorResponse {
+  let mut response = ErrorResponse::new(Some(message.to_string()));
+  *response.status_mut() = tauri::http::StatusCode::FORBIDDEN;
+  response
+}
+
+fn validate_minecraft_proxy_handshake(
+  request: &Request,
+  expected_path: &str,
+) -> Result<(), String> {
+  if request.uri().path() != expected_path {
+    return Err("Invalid Minecraft proxy path.".into());
+  }
+
+  let origin = request
+    .headers()
+    .get("origin")
+    .and_then(|value| value.to_str().ok())
+    .ok_or_else(|| "Minecraft proxy origin is missing.".to_string())?;
+
+  if !is_allowed_minecraft_proxy_origin(origin) {
+    return Err("Minecraft proxy origin is not allowed.".into());
+  }
+
+  Ok(())
+}
+
+async fn run_minecraft_proxy_connection(
+  app: tauri::AppHandle,
+  proxy_id: String,
+  host: String,
+  port: u16,
+  ws_url: String,
+  target_addresses: Vec<SocketAddr>,
+  local_stream: TcpStream,
+  connected: Arc<AtomicBool>,
+  mut shutdown_rx: watch::Receiver<bool>,
+) -> Result<(), String> {
+  let expected_path = format!("{MINECRAFT_PROXY_PATH_PREFIX}{proxy_id}");
+  let websocket = tokio::select! {
+    _ = shutdown_rx.changed() => return Ok(()),
+    result = accept_hdr_async(local_stream, |request: &Request, response: Response| {
+      validate_minecraft_proxy_handshake(request, &expected_path)
+        .map(|_| response)
+        .map_err(|err| minecraft_proxy_handshake_error(&err))
+    }) => result.map_err(|err| format!("Could not accept Minecraft proxy WebSocket: {err}"))?,
+  };
+
+  let tcp_stream = tokio::select! {
+    _ = shutdown_rx.changed() => return Ok(()),
+    result = TcpStream::connect(target_addresses.as_slice()) => {
+      result.map_err(|err| format!("Could not connect to Minecraft server {host}:{port}: {err}"))?
+    }
+  };
+
+  connected.store(true, Ordering::SeqCst);
+  emit_minecraft_proxy_info(
+    &app,
+    MINECRAFT_PROXY_CONNECTED_EVENT,
+    MinecraftProxyInfo {
+      proxy_id: proxy_id.clone(),
+      host: host.clone(),
+      port,
+      ws_url: ws_url.clone(),
+      connected: true,
+    },
+  );
+
+  let result = async {
+    let (mut ws_write, mut ws_read) = websocket.split();
+    let (mut tcp_read, mut tcp_write) = tcp_stream.into_split();
+    let mut buffer = vec![0u8; MINECRAFT_PROXY_READ_BUFFER_BYTES];
+
+    loop {
+      tokio::select! {
+        _ = shutdown_rx.changed() => break,
+        message = ws_read.next() => {
+          match message {
+            Some(Ok(Message::Binary(bytes))) => {
+              tcp_write
+                .write_all(&bytes)
+                .await
+                .map_err(|err| format!("Could not write Minecraft proxy TCP data: {err}"))?;
+            }
+            Some(Ok(Message::Ping(bytes))) => {
+              ws_write
+                .send(Message::Pong(bytes))
+                .await
+                .map_err(|err| format!("Could not write Minecraft proxy WebSocket pong: {err}"))?;
+            }
+            Some(Ok(Message::Text(_))) => {
+              return Err("Minecraft proxy accepts only binary WebSocket frames.".into());
+            }
+            Some(Ok(Message::Close(_))) | None => break,
+            Some(Ok(_)) => {}
+            Some(Err(err)) => {
+              return Err(format!("Minecraft proxy WebSocket failed: {err}"));
+            }
+          }
+        }
+        read = tcp_read.read(&mut buffer) => {
+          let read = read.map_err(|err| format!("Could not read Minecraft proxy TCP data: {err}"))?;
+          if read == 0 {
+            break;
+          }
+
+          ws_write
+            .send(Message::Binary(buffer[..read].to_vec().into()))
+            .await
+            .map_err(|err| format!("Could not write Minecraft proxy WebSocket data: {err}"))?;
+        }
+      }
+    }
+
+    let _ = ws_write.close().await;
+    Ok(())
+  }
+  .await;
+
+  if connected.swap(false, Ordering::SeqCst) {
+    emit_minecraft_proxy_info(
+      &app,
+      MINECRAFT_PROXY_DISCONNECTED_EVENT,
+      MinecraftProxyInfo {
+        proxy_id,
+        host,
+        port,
+        ws_url,
+        connected: false,
+      },
+    );
+  }
+
+  result
+}
+
+async fn run_minecraft_proxy_listener(
+  app: tauri::AppHandle,
+  proxy_id: String,
+  host: String,
+  port: u16,
+  ws_url: String,
+  target_addresses: Vec<SocketAddr>,
+  listener: TcpListener,
+  connected: Arc<AtomicBool>,
+  mut shutdown_rx: watch::Receiver<bool>,
+) {
+  loop {
+    let accepted = tokio::select! {
+      _ = shutdown_rx.changed() => break,
+      accepted = listener.accept() => accepted,
+    };
+
+    let (local_stream, peer_addr) = match accepted {
+      Ok(value) => value,
+      Err(err) => {
+        emit_minecraft_proxy_error(
+          &app,
+          &proxy_id,
+          format!("Minecraft proxy listener failed: {err}"),
+        );
+        break;
+      }
+    };
+
+    if !peer_addr.ip().is_loopback() {
+      emit_minecraft_proxy_error(
+        &app,
+        &proxy_id,
+        "Minecraft proxy rejected non-local WebSocket client.",
+      );
+      continue;
+    }
+
+    if let Err(err) = run_minecraft_proxy_connection(
+      app.clone(),
+      proxy_id.clone(),
+      host.clone(),
+      port,
+      ws_url.clone(),
+      target_addresses.clone(),
+      local_stream,
+      Arc::clone(&connected),
+      shutdown_rx.clone(),
+    )
+    .await
+    {
+      emit_minecraft_proxy_error(&app, &proxy_id, err);
+    }
+  }
+
+  connected.store(false, Ordering::SeqCst);
+  if let Some(proxy) = app.state::<AppState>().remove_minecraft_proxy(&proxy_id) {
+    emit_minecraft_proxy_info(&app, MINECRAFT_PROXY_STOPPED_EVENT, proxy.info());
+  }
+}
+
+fn shutdown_minecraft_proxies(app: &tauri::AppHandle) {
+  for proxy in app.state::<AppState>().take_minecraft_proxies() {
+    proxy.connected.store(false, Ordering::SeqCst);
+    let info = proxy.info();
+    let _ = proxy.shutdown_tx.send(true);
+    emit_minecraft_proxy_info(app, MINECRAFT_PROXY_STOPPED_EVENT, info);
+  }
+}
+
 fn discord_presence_details(mode: &str) -> Option<&'static str> {
   match mode {
     "editing" => Some("Editing a project"),
@@ -896,7 +1456,9 @@ fn discord_presence_details(mode: &str) -> Option<&'static str> {
   }
 }
 
-fn build_discord_activity(payload: &DiscordPresencePayload) -> Result<activity::Activity<'static>, String> {
+fn build_discord_activity(
+  payload: &DiscordPresencePayload,
+) -> Result<activity::Activity<'static>, String> {
   let details = discord_presence_details(payload.mode.trim())
     .ok_or_else(|| format!("Unsupported Discord presence mode: {}", payload.mode))?;
 
@@ -907,15 +1469,26 @@ fn build_discord_activity(payload: &DiscordPresencePayload) -> Result<activity::
         .large_image(DISCORD_LARGE_IMAGE_KEY)
         .large_text("BDEngine"),
     )
-    .buttons(vec![activity::Button::new("Open BDEngine", DISCORD_OPEN_URL)]);
+    .buttons(vec![activity::Button::new(
+      "Open BDEngine",
+      DISCORD_OPEN_URL,
+    )]);
 
   if payload.mode.trim() == "share_party" {
     let current_size = payload.current_size.unwrap_or(0).max(0);
     let max_size = payload.max_size.unwrap_or(0).max(current_size);
     activity = activity.state(format!("{current_size}/{max_size} users connected"));
 
-    if let Some(party_id) = payload.party_id.as_deref().filter(|value| !value.trim().is_empty()) {
-      activity = activity.party(activity::Party::new().id(party_id.to_string()).size([current_size, max_size]));
+    if let Some(party_id) = payload
+      .party_id
+      .as_deref()
+      .filter(|value| !value.trim().is_empty())
+    {
+      activity = activity.party(
+        activity::Party::new()
+          .id(party_id.to_string())
+          .size([current_size, max_size]),
+      );
     }
   }
 
@@ -1111,9 +1684,11 @@ fn build_splash_html() -> String {
 
 fn prepare_splash_html_file() -> Result<PathBuf, String> {
   let splash_dir = splash_runtime_dir();
-  fs::create_dir_all(&splash_dir).map_err(|err| format!("Could not create splash directory: {err}"))?;
+  fs::create_dir_all(&splash_dir)
+    .map_err(|err| format!("Could not create splash directory: {err}"))?;
   let splash_path = splash_dir.join("splash.html");
-  fs::write(&splash_path, build_splash_html()).map_err(|err| format!("Could not write splash html: {err}"))?;
+  fs::write(&splash_path, build_splash_html())
+    .map_err(|err| format!("Could not write splash html: {err}"))?;
   Ok(splash_path)
 }
 
@@ -1122,31 +1697,26 @@ fn create_splash_window(app: &tauri::AppHandle) -> tauri::Result<WebviewWindow> 
     return Ok(window);
   }
 
-  let splash_path = prepare_splash_html_file()
-    .map_err(std::io::Error::other)?;
+  let splash_path = prepare_splash_html_file().map_err(std::io::Error::other)?;
   let splash_url = Url::from_file_path(&splash_path)
     .map_err(|_| std::io::Error::other("Could not convert splash path to file URL."))?;
 
-  WebviewWindowBuilder::new(
-    app,
-    SPLASH_WINDOW_LABEL,
-    WebviewUrl::External(splash_url),
-  )
-  .title("BDEngine")
-  .inner_size(600.0, 338.0)
-  .resizable(false)
-  .minimizable(false)
-  .maximizable(false)
-  .closable(false)
-  .fullscreen(false)
-  .visible(true)
-  .center()
-  .decorations(false)
-  .shadow(false)
-  .transparent(true)
-  .always_on_top(true)
-  .skip_taskbar(true)
-  .build()
+  WebviewWindowBuilder::new(app, SPLASH_WINDOW_LABEL, WebviewUrl::External(splash_url))
+    .title("BDEngine")
+    .inner_size(600.0, 338.0)
+    .resizable(false)
+    .minimizable(false)
+    .maximizable(false)
+    .closable(false)
+    .fullscreen(false)
+    .visible(true)
+    .center()
+    .decorations(false)
+    .shadow(false)
+    .transparent(true)
+    .always_on_top(true)
+    .skip_taskbar(true)
+    .build()
 }
 
 fn reveal_main_window(app: &tauri::AppHandle, window: &WebviewWindow, is_revealed: &AtomicBool) {
@@ -1162,7 +1732,10 @@ fn reveal_main_window(app: &tauri::AppHandle, window: &WebviewWindow, is_reveale
   }
 }
 
-fn create_main_window(app: &tauri::AppHandle, context: &LaunchContext) -> tauri::Result<WebviewWindow> {
+fn create_main_window(
+  app: &tauri::AppHandle,
+  context: &LaunchContext,
+) -> tauri::Result<WebviewWindow> {
   let mut config = app
     .config()
     .app
@@ -1276,7 +1849,8 @@ fn set_release_channel(
   state: tauri::State<'_, AppState>,
   channel: String,
 ) -> Result<String, String> {
-  let channel = ReleaseChannel::from_str(&channel).ok_or_else(|| "Unsupported release channel.".to_string())?;
+  let channel =
+    ReleaseChannel::from_str(&channel).ok_or_else(|| "Unsupported release channel.".to_string())?;
   persist_release_channel(&app, channel)?;
   state.set_release_channel(channel);
   Ok(channel.as_str().to_string())
@@ -1376,7 +1950,8 @@ fn download_update(app: tauri::AppHandle, url: String, file_name: String) -> Res
 
   std::thread::spawn(move || {
     let result = (|| -> Result<(), String> {
-      fs::create_dir_all(&download_dir).map_err(|err| format!("Could not create update directory: {err}"))?;
+      fs::create_dir_all(&download_dir)
+        .map_err(|err| format!("Could not create update directory: {err}"))?;
 
       if download_path.exists() {
         let _ = fs::remove_file(&download_path);
@@ -1386,7 +1961,10 @@ fn download_update(app: tauri::AppHandle, url: String, file_name: String) -> Res
         .map_err(|err| format!("Could not start update download: {err}"))?;
 
       if !response.status().is_success() {
-        return Err(format!("Update download failed with status {}.", response.status()));
+        return Err(format!(
+          "Update download failed with status {}.",
+          response.status()
+        ));
       }
 
       let total_bytes = response.content_length();
@@ -1399,7 +1977,8 @@ fn download_update(app: tauri::AppHandle, url: String, file_name: String) -> Res
       );
 
       let mut response = response;
-      let mut file = fs::File::create(&download_path).map_err(|err| format!("Could not create update file: {err}"))?;
+      let mut file = fs::File::create(&download_path)
+        .map_err(|err| format!("Could not create update file: {err}"))?;
       let mut buffer = [0u8; 64 * 1024];
       let mut downloaded_bytes = 0u64;
 
@@ -1437,7 +2016,9 @@ fn download_update(app: tauri::AppHandle, url: String, file_name: String) -> Res
         );
       }
 
-      file.flush().map_err(|err| format!("Could not finalize update file: {err}"))?;
+      file
+        .flush()
+        .map_err(|err| format!("Could not finalize update file: {err}"))?;
 
       app
         .state::<AppState>()
@@ -1491,6 +2072,130 @@ fn clipboard_write_items(items: Vec<ClipboardItemPayload>) -> Result<(), String>
   }
 }
 
+#[tauri::command]
+async fn minecraft_proxy_start(
+  app: tauri::AppHandle,
+  state: tauri::State<'_, AppState>,
+  host: String,
+  port: Option<u32>,
+) -> Result<MinecraftProxyStartPayload, String> {
+  let (host, target_addresses) =
+    validate_minecraft_proxy_target(&host, port.unwrap_or(MINECRAFT_PROXY_DEFAULT_PORT)).await?;
+  let port = target_addresses
+    .first()
+    .map(SocketAddr::port)
+    .ok_or_else(|| "Minecraft proxy target did not resolve to any address.".to_string())?;
+
+  let listener = TcpListener::bind(SocketAddr::from((Ipv4Addr::new(127, 0, 0, 1), 0)))
+    .await
+    .map_err(|err| format!("Could not start local Minecraft proxy: {err}"))?;
+  let local_port = listener
+    .local_addr()
+    .map_err(|err| format!("Could not read local Minecraft proxy address: {err}"))?
+    .port();
+
+  let proxy_id = Uuid::new_v4().to_string();
+  let ws_url = format!("ws://127.0.0.1:{local_port}{MINECRAFT_PROXY_PATH_PREFIX}{proxy_id}");
+  let connected = Arc::new(AtomicBool::new(false));
+  let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+  let proxy = MinecraftProxyHandle {
+    proxy_id: proxy_id.clone(),
+    host: host.clone(),
+    port,
+    ws_url: ws_url.clone(),
+    connected: Arc::clone(&connected),
+    shutdown_tx,
+  };
+  let proxy_info = proxy.info();
+  state.insert_minecraft_proxy(proxy);
+
+  emit_minecraft_proxy_info(&app, MINECRAFT_PROXY_STARTED_EVENT, proxy_info);
+
+  tauri::async_runtime::spawn(run_minecraft_proxy_listener(
+    app,
+    proxy_id.clone(),
+    host,
+    port,
+    ws_url.clone(),
+    target_addresses,
+    listener,
+    connected,
+    shutdown_rx,
+  ));
+
+  Ok(MinecraftProxyStartPayload { proxy_id, ws_url })
+}
+
+#[tauri::command]
+fn minecraft_proxy_stop(
+  app: tauri::AppHandle,
+  state: tauri::State<'_, AppState>,
+  proxy_id: String,
+) -> Result<(), String> {
+  let proxy_id = proxy_id.trim();
+  if proxy_id.is_empty() {
+    return Err("Minecraft proxy id is empty.".into());
+  }
+
+  let Some(proxy) = state.remove_minecraft_proxy(proxy_id) else {
+    return Ok(());
+  };
+
+  proxy.connected.store(false, Ordering::SeqCst);
+  let info = proxy.info();
+  let _ = proxy.shutdown_tx.send(true);
+  emit_minecraft_proxy_info(&app, MINECRAFT_PROXY_STOPPED_EVENT, info);
+  Ok(())
+}
+
+#[tauri::command]
+fn minecraft_proxy_status(state: tauri::State<'_, AppState>) -> MinecraftProxyStatusPayload {
+  state.minecraft_proxy_status()
+}
+
+#[tauri::command]
+async fn minecraft_lan_discover(
+  timeout_ms: Option<u64>,
+) -> Result<Vec<MinecraftLanServerPayload>, String> {
+  let timeout_ms = timeout_ms.unwrap_or(MINECRAFT_LAN_DISCOVERY_DEFAULT_TIMEOUT_MS);
+  let socket = create_minecraft_lan_discovery_socket()?;
+  let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+  let mut buffer = vec![0u8; MINECRAFT_LAN_PACKET_MAX_BYTES];
+  let mut servers = Vec::new();
+  let mut seen = HashSet::new();
+
+  loop {
+    let now = Instant::now();
+    if now >= deadline {
+      break;
+    }
+
+    let remaining = deadline - now;
+    let received = match timeout(remaining, socket.recv_from(&mut buffer)).await {
+      Ok(Ok(value)) => value,
+      Ok(Err(err)) => {
+        return Err(format!(
+          "Could not receive Minecraft LAN announcement: {err}"
+        ))
+      }
+      Err(_) => break,
+    };
+
+    let (read, sender) = received;
+    let message = String::from_utf8_lossy(&buffer[..read]);
+    let Some(server) = parse_minecraft_lan_announcement(&message, sender) else {
+      continue;
+    };
+
+    if seen.insert(format!("{}:{}", server.host, server.port)) {
+      servers.push(server);
+    }
+  }
+
+  Ok(servers)
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
   #[cfg(target_os = "windows")]
@@ -1512,7 +2217,9 @@ pub fn run() {
                 err, WEBVIEW2_DOWNLOAD_URL
               ),
             );
-            let _ = Url::parse(WEBVIEW2_DOWNLOAD_URL).ok().map(|url| open_url_in_system_browser(&url));
+            let _ = Url::parse(WEBVIEW2_DOWNLOAD_URL)
+              .ok()
+              .map(|url| open_url_in_system_browser(&url));
             return;
           }
         }
@@ -1533,7 +2240,11 @@ pub fn run() {
       clear_discord_presence,
       download_update,
       clipboard_read_items,
-      clipboard_write_items
+      clipboard_write_items,
+      minecraft_proxy_start,
+      minecraft_proxy_stop,
+      minecraft_proxy_status,
+      minecraft_lan_discover
     ])
     .plugin(tauri_plugin_notification::init())
     .plugin(tauri_plugin_single_instance::init(|app, argv, _cwd| {
@@ -1543,7 +2254,11 @@ pub fn run() {
     .setup(|app| {
       let channel = load_release_channel(app.handle());
       app.state::<AppState>().set_release_channel(channel);
-      let context = parse_launch_context(env::args_os().skip(1).map(|arg| arg.to_string_lossy().into_owned()));
+      let context = parse_launch_context(
+        env::args_os()
+          .skip(1)
+          .map(|arg| arg.to_string_lossy().into_owned()),
+      );
       create_splash_window(app.handle())?;
       Ok(apply_launch_context(app.handle(), context)?)
     })
@@ -1552,6 +2267,7 @@ pub fn run() {
 
   app.run(|app_handle, event| {
     if let tauri::RunEvent::Exit = event {
+      shutdown_minecraft_proxies(app_handle);
       close_discord_presence_if_any(app_handle);
       launch_pending_installer_if_any(app_handle);
     }
