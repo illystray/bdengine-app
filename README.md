@@ -11,6 +11,7 @@ It does not include the full web editor source code.
 - `.bdengine` file association
 - `bdengine://` deep link support
 - custom Windows file icon integration
+- remembered editor window size, position, and maximized/fullscreen state
 
 ## Notes
 

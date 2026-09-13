@@ -1,6 +1,6 @@
 [package]
 name = "bdengine_app"
-version = "1.0.13"
+version = "1.0.15"
 description = "Windows desktop shell for https://bdengine.app"
 authors = ["BDEngine"]
 license = "UNLICENSED"
@@ -27,6 +27,7 @@ socket2 = "0.6"
 tauri = { version = "2.10.3", features = ["devtools", "image-png"] }
 tauri-plugin-notification = "2"
 tauri-plugin-single-instance = "2"
+tauri-plugin-window-state = "2.4.1"
 tokio = { version = "1", features = ["io-util", "macros", "net", "sync", "time"] }
 tokio-tungstenite = "0.26"
 url = "2"

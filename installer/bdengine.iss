@@ -1,5 +1,5 @@
 #define AppName "BDEngine"
-#define AppVersion "1.0.13"
+#define AppVersion "1.0.15"
 #define AppPublisher "illystray Creations"
 #define AppExeName "bdengine_app.exe"
 #define AppAssocName "BDEngine File"

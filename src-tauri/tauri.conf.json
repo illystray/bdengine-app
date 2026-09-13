@@ -1,11 +1,11 @@
 {
     "$schema":  "../node_modules/@tauri-apps/cli/config.schema.json",
     "productName":  "BDEngine",
-    "version":  "1.0.13",
+    "version":  "1.0.15",
     "identifier":  "app.bdengine.desktop",
     "build":  {
-                  "frontendDist":  "https://bdengine.app/?appReal=true&appVersion=13",
-                  "devUrl":  "https://bdengine.app/?appReal=true&appVersion=13"
+                  "frontendDist":  "https://bdengine.app/?appReal=true&appVersion=15",
+                  "devUrl":  "https://bdengine.app/?appReal=true&appVersion=15"
               },
     "app":  {
                 "windows":  [
@@ -21,7 +21,7 @@
                                     "dragDropEnabled":  false,
                                     "fullscreen":  false,
                                     "center":  true,
-                                    "maximized":  true,
+                                    "maximized":  false,
                                     "decorations":  false
                                 }
                             ],

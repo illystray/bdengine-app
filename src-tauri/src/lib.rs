@@ -1,6 +1,6 @@
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
-use discord_rich_presence::{activity, DiscordIpc, DiscordIpcClient};
+use discord_rich_presence::activity;
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use socket2::{Domain, Protocol, Socket, Type};
@@ -42,6 +42,8 @@ use tokio_tungstenite::{
 };
 use url::Url;
 use uuid::Uuid;
+mod discord_presence;
+use discord_presence::DiscordPresence;
 #[cfg(target_os = "windows")]
 use windows::{
   core::{w, PCWSTR},
@@ -67,7 +69,7 @@ const TASKBAR_ICON_PNG: &[u8] = include_bytes!("../icons/32x32.png");
 const SPLASH_IMAGE_PNG: &[u8] = include_bytes!("../splash/splash.png");
 const APP_CONFIG_FILE_NAME: &str = "config.json";
 const APP_IDENTIFIER: &str = "app.bdengine.desktop";
-const APP_VERSION: u32 = 13;
+const APP_VERSION: u32 = 15;
 const DISCORD_APPLICATION_ID: &str = "1514012998455529483";
 const DISCORD_LARGE_IMAGE_KEY: &str = "bde_logo";
 const DISCORD_OPEN_URL: &str = "https://bdengine.app";
@@ -278,7 +280,6 @@ struct AppState {
   launch_context: Mutex<LaunchContext>,
   release_channel: Mutex<ReleaseChannel>,
   pending_installer_path: Mutex<Option<PathBuf>>,
-  discord_client: Mutex<Option<DiscordIpcClient>>,
   minecraft_proxies: Mutex<HashMap<String, MinecraftProxyHandle>>,
 }
 
@@ -333,56 +334,6 @@ impl AppState {
       .lock()
       .expect("pending installer state poisoned")
       .take()
-  }
-
-  fn with_discord_client<F>(&self, mut action: F) -> Result<(), String>
-  where
-    F: FnMut(&mut DiscordIpcClient) -> Result<(), String>,
-  {
-    let mut guard = self
-      .discord_client
-      .lock()
-      .expect("discord presence state poisoned");
-
-    if guard.is_none() {
-      let mut client = DiscordIpcClient::new(DISCORD_APPLICATION_ID);
-      if client.connect().is_err() {
-        return Ok(());
-      }
-      *guard = Some(client);
-    }
-
-    let client = guard.as_mut().expect("discord client must be initialized");
-    if action(client).is_err() {
-      let mut client = DiscordIpcClient::new(DISCORD_APPLICATION_ID);
-      if client.connect().is_err() {
-        *guard = None;
-        return Ok(());
-      }
-
-      if action(&mut client).is_err() {
-        *guard = None;
-        return Ok(());
-      }
-
-      *guard = Some(client);
-    }
-
-    Ok(())
-  }
-
-  fn clear_discord_client(&self) {
-    let mut guard = self
-      .discord_client
-      .lock()
-      .expect("discord presence state poisoned");
-
-    if let Some(client) = guard.as_mut() {
-      let _ = client.clear_activity();
-      let _ = client.close();
-    }
-
-    *guard = None;
   }
 
   fn insert_minecraft_proxy(&self, proxy: MinecraftProxyHandle) {
@@ -1065,7 +1016,7 @@ fn launch_pending_installer_if_any(app: &tauri::AppHandle) {
 }
 
 fn close_discord_presence_if_any(app: &tauri::AppHandle) {
-  app.state::<AppState>().clear_discord_client();
+  app.state::<DiscordPresence>().shutdown();
 }
 
 fn emit_minecraft_proxy_info(app: &tauri::AppHandle, event: &str, info: MinecraftProxyInfo) {
@@ -1909,7 +1860,7 @@ fn save_binary_file(file_name: String, content: Vec<u8>) -> Result<Option<String
 
 #[tauri::command]
 fn set_discord_presence(
-  state: tauri::State<'_, AppState>,
+  presence: tauri::State<'_, DiscordPresence>,
   mode: String,
   party_id: Option<String>,
   current_size: Option<i32>,
@@ -1922,17 +1873,12 @@ fn set_discord_presence(
     max_size,
   };
   let activity = build_discord_activity(&payload)?;
-  state.with_discord_client(|client| {
-    client
-      .set_activity(activity.clone())
-      .map_err(|err| format!("Could not set Discord activity: {err}"))
-  })
+  presence.set(activity)
 }
 
 #[tauri::command]
-fn clear_discord_presence(state: tauri::State<'_, AppState>) -> Result<(), String> {
-  state.clear_discord_client();
-  Ok(())
+fn clear_discord_presence(presence: tauri::State<'_, DiscordPresence>) -> Result<(), String> {
+  presence.clear()
 }
 
 #[tauri::command]
@@ -2251,7 +2197,20 @@ pub fn run() {
       let context = parse_launch_context(argv.into_iter().skip(1));
       let _ = apply_launch_context(app, context);
     }))
+    .plugin(
+      tauri_plugin_window_state::Builder::default()
+        .with_filter(|label| label == MAIN_WINDOW_LABEL)
+        // Keep the splash/reveal flow in charge of visibility and preserve our custom frame.
+        .with_state_flags(
+          tauri_plugin_window_state::StateFlags::SIZE
+            | tauri_plugin_window_state::StateFlags::POSITION
+            | tauri_plugin_window_state::StateFlags::MAXIMIZED
+            | tauri_plugin_window_state::StateFlags::FULLSCREEN,
+        )
+        .build(),
+    )
     .setup(|app| {
+      app.manage(DiscordPresence::new(DISCORD_APPLICATION_ID)?);
       let channel = load_release_channel(app.handle());
       app.state::<AppState>().set_release_channel(channel);
       let context = parse_launch_context(
