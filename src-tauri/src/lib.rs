@@ -43,7 +43,13 @@ use tokio_tungstenite::{
 use url::Url;
 use uuid::Uuid;
 mod discord_presence;
+mod graphics_backend;
+mod update_retry;
+#[cfg(test)]
+mod config_tests;
 use discord_presence::DiscordPresence;
+use graphics_backend::{GraphicsBackend, GraphicsSettings, LaunchGraphics};
+use tauri_plugin_window_state::{AppHandleExt, StateFlags};
 #[cfg(target_os = "windows")]
 use windows::{
   core::{w, PCWSTR},
@@ -69,7 +75,7 @@ const TASKBAR_ICON_PNG: &[u8] = include_bytes!("../icons/32x32.png");
 const SPLASH_IMAGE_PNG: &[u8] = include_bytes!("../splash/splash.png");
 const APP_CONFIG_FILE_NAME: &str = "config.json";
 const APP_IDENTIFIER: &str = "app.bdengine.desktop";
-const APP_VERSION: u32 = 15;
+const APP_VERSION: u32 = 16;
 const DISCORD_APPLICATION_ID: &str = "1514012998455529483";
 const DISCORD_LARGE_IMAGE_KEY: &str = "bde_logo";
 const DISCORD_OPEN_URL: &str = "https://bdengine.app";
@@ -136,6 +142,8 @@ impl ReleaseChannel {
 struct AppConfig {
   release_channel: ReleaseChannel,
   webview2_checked: bool,
+  #[serde(default)]
+  graphics_backend: GraphicsBackend,
 }
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -277,6 +285,8 @@ impl MinecraftProxyHandle {
 
 #[derive(Default)]
 struct AppState {
+  config_access: Mutex<()>,
+  restart_requested: AtomicBool,
   launch_context: Mutex<LaunchContext>,
   release_channel: Mutex<ReleaseChannel>,
   pending_installer_path: Mutex<Option<PathBuf>>,
@@ -904,10 +914,16 @@ fn app_config_path(app: &tauri::AppHandle) -> Option<PathBuf> {
 }
 
 fn load_app_config_from_path(path: &Path) -> AppConfig {
-  fs::read_to_string(path)
-    .ok()
-    .and_then(|contents| serde_json::from_str::<AppConfig>(&contents).ok())
-    .unwrap_or_default()
+  read_app_config_from_path(path).unwrap_or_default()
+}
+
+fn read_app_config_from_path(path: &Path) -> Result<AppConfig, String> {
+  match fs::read_to_string(path) {
+    Ok(contents) => serde_json::from_str(&contents)
+      .map_err(|err| format!("Could not parse app config: {err}")),
+    Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(AppConfig::default()),
+    Err(err) => Err(format!("Could not read app config: {err}")),
+  }
 }
 
 fn save_app_config_to_path(path: &Path, config: &AppConfig) -> Result<(), String> {
@@ -919,7 +935,19 @@ fn save_app_config_to_path(path: &Path, config: &AppConfig) -> Result<(), String
     .map_err(|err| format!("Could not create app config directory: {err}"))?;
   let contents = serde_json::to_vec_pretty(config)
     .map_err(|err| format!("Could not serialize app config: {err}"))?;
-  fs::write(path, contents).map_err(|err| format!("Could not save app config: {err}"))
+  // Replace only after a complete write, so a failed save keeps the old config.
+  let temporary = parent.join(format!("config-{}.tmp", Uuid::new_v4()));
+  let result = (|| -> std::io::Result<()> {
+    let mut file = fs::OpenOptions::new().write(true).create_new(true).open(&temporary)?;
+    file.write_all(&contents)?;
+    file.sync_all()?;
+    drop(file);
+    fs::rename(&temporary, path)
+  })();
+  if result.is_err() {
+    let _ = fs::remove_file(&temporary);
+  }
+  result.map_err(|err| format!("Could not save app config: {err}"))
 }
 
 fn load_app_config(app: &tauri::AppHandle) -> AppConfig {
@@ -930,18 +958,35 @@ fn load_app_config(app: &tauri::AppHandle) -> AppConfig {
   load_app_config_from_path(&path)
 }
 
-fn load_release_channel(app: &tauri::AppHandle) -> ReleaseChannel {
-  load_app_config(app).release_channel
-}
-
 fn persist_release_channel(app: &tauri::AppHandle, channel: ReleaseChannel) -> Result<(), String> {
+  let state = app.state::<AppState>();
+  let _guard = state.config_access.lock().map_err(|_| "App config lock is poisoned.")?;
   let Some(path) = app_config_path(app) else {
     return Err("Could not resolve app config directory.".into());
   };
 
-  let mut config = load_app_config_from_path(&path);
+  let mut config = read_app_config_from_path(&path)?;
   config.release_channel = channel;
   save_app_config_to_path(&path, &config)
+}
+
+fn persist_graphics_backend_to_path(path: &Path, value: &str) -> Result<GraphicsBackend, String> {
+  let backend = GraphicsBackend::parse(value)?;
+  let mut config = read_app_config_from_path(path)?;
+  config.graphics_backend = backend;
+  save_app_config_to_path(path, &config)?;
+  Ok(backend)
+}
+
+fn window_state_flags() -> StateFlags {
+  StateFlags::SIZE | StateFlags::POSITION | StateFlags::MAXIMIZED | StateFlags::FULLSCREEN
+}
+
+fn clean_restart_environment(mut environment: tauri::Env) -> tauri::Env {
+  // Initial/second-instance launches still use the real OS arguments. Only
+  // Tauri's restart arguments omit files and deep links that were already handled.
+  environment.args_os.truncate(1);
+  environment
 }
 
 fn taskbar_icon() -> Option<Image<'static>> {
@@ -998,6 +1043,11 @@ fn launch_installer(installer_path: &Path) -> Result<(), String> {
 
 fn launch_pending_installer_if_any(app: &tauri::AppHandle) {
   let state = app.state::<AppState>();
+  // A download can finish after restart_app checks for a pending installer.
+  // Let the next session offer the update instead of racing it with relaunch.
+  if state.restart_requested.load(Ordering::SeqCst) {
+    return;
+  }
   let Some(installer_path) = state.take_pending_installer_path() else {
     return;
   };
@@ -1652,7 +1702,7 @@ fn create_splash_window(app: &tauri::AppHandle) -> tauri::Result<WebviewWindow> 
   let splash_url = Url::from_file_path(&splash_path)
     .map_err(|_| std::io::Error::other("Could not convert splash path to file URL."))?;
 
-  WebviewWindowBuilder::new(app, SPLASH_WINDOW_LABEL, WebviewUrl::External(splash_url))
+  let mut builder = WebviewWindowBuilder::new(app, SPLASH_WINDOW_LABEL, WebviewUrl::External(splash_url))
     .title("BDEngine")
     .inner_size(600.0, 338.0)
     .resizable(false)
@@ -1666,8 +1716,12 @@ fn create_splash_window(app: &tauri::AppHandle) -> tauri::Result<WebviewWindow> 
     .shadow(false)
     .transparent(true)
     .always_on_top(true)
-    .skip_taskbar(true)
-    .build()
+    .skip_taskbar(true);
+  #[cfg(target_os = "windows")]
+  if let Some(arguments) = app.state::<LaunchGraphics>().browser_arguments() {
+    builder = builder.additional_browser_args(arguments);
+  }
+  builder.build()
 }
 
 fn reveal_main_window(app: &tauri::AppHandle, window: &WebviewWindow, is_revealed: &AtomicBool) {
@@ -1733,6 +1787,11 @@ fn create_main_window(
       }
     });
 
+  #[cfg(target_os = "windows")]
+  if let Some(arguments) = app.state::<LaunchGraphics>().browser_arguments() {
+    builder = builder.additional_browser_args(arguments);
+  }
+
   if let Some(icon) = taskbar_icon() {
     builder = builder.icon(icon)?;
   }
@@ -1783,6 +1842,47 @@ fn apply_launch_context(app: &tauri::AppHandle, context: LaunchContext) -> tauri
 #[tauri::command]
 fn get_release_channel(state: tauri::State<'_, AppState>) -> String {
   state.get_release_channel().as_str().to_string()
+}
+
+#[tauri::command]
+fn get_graphics_settings(
+  app: tauri::AppHandle,
+  state: tauri::State<'_, AppState>,
+  graphics: tauri::State<'_, LaunchGraphics>,
+) -> Result<GraphicsSettings, String> {
+  let _guard = state.config_access.lock().map_err(|_| "App config lock is poisoned.")?;
+  let path = app_config_path(&app).ok_or("Could not resolve app config directory.")?;
+  let config = read_app_config_from_path(&path)?;
+  Ok(graphics.settings(config.graphics_backend))
+}
+
+#[tauri::command]
+fn set_graphics_backend(
+  app: tauri::AppHandle,
+  state: tauri::State<'_, AppState>,
+  graphics: tauri::State<'_, LaunchGraphics>,
+  backend: String,
+) -> Result<GraphicsSettings, String> {
+  graphics.ensure_configurable()?;
+  let _guard = state.config_access.lock().map_err(|_| "App config lock is poisoned.")?;
+  let path = app_config_path(&app).ok_or("Could not resolve app config directory.")?;
+  let saved = persist_graphics_backend_to_path(&path, &backend)?;
+  Ok(graphics.settings(saved))
+}
+
+#[tauri::command]
+fn restart_app(app: tauri::AppHandle, state: tauri::State<'_, AppState>) -> Result<(), String> {
+  if state.pending_installer_path.lock().map_err(|_| "Update state lock is poisoned.")?.is_some() {
+    return Err("An app update is pending. Complete the update before restarting the app.".into());
+  }
+  // The frontend must save or discard unsaved projects before invoking this.
+  app.save_window_state(window_state_flags())
+    .map_err(|err| format!("Could not save window state before restart: {err}"))?;
+  // Unlike restart() on the main thread, this delivers plugin Exit events and
+  // releases the single-instance lock before spawning the new process.
+  state.restart_requested.store(true, Ordering::SeqCst);
+  app.request_restart();
+  Ok(())
 }
 
 #[tauri::command]
@@ -1895,91 +1995,112 @@ fn download_update(app: tauri::AppHandle, url: String, file_name: String) -> Res
   app.state::<AppState>().clear_pending_installer_path();
 
   std::thread::spawn(move || {
-    let result = (|| -> Result<(), String> {
-      fs::create_dir_all(&download_dir)
-        .map_err(|err| format!("Could not create update directory: {err}"))?;
+    let result = update_retry::run(
+      || -> Result<(), update_retry::Failure> {
+        fs::create_dir_all(&download_dir).map_err(|err| {
+          update_retry::Failure::from_error("Could not create update directory", &err, false)
+        })?;
 
-      if download_path.exists() {
-        let _ = fs::remove_file(&download_path);
-      }
-
-      let response = reqwest::blocking::get(&download_url)
-        .map_err(|err| format!("Could not start update download: {err}"))?;
-
-      if !response.status().is_success() {
-        return Err(format!(
-          "Update download failed with status {}.",
-          response.status()
-        ));
-      }
-
-      let total_bytes = response.content_length();
-      let _ = app.emit(
-        UPDATE_DOWNLOAD_STARTED_EVENT,
-        UpdateDownloadStartedPayload {
-          file_name: file_name.clone(),
-          total_bytes,
-        },
-      );
-
-      let mut response = response;
-      let mut file = fs::File::create(&download_path)
-        .map_err(|err| format!("Could not create update file: {err}"))?;
-      let mut buffer = [0u8; 64 * 1024];
-      let mut downloaded_bytes = 0u64;
-
-      loop {
-        let read = response
-          .read(&mut buffer)
-          .map_err(|err| format!("Could not read update stream: {err}"))?;
-
-        if read == 0 {
-          break;
+        if download_path.exists() {
+          fs::remove_file(&download_path).map_err(|err| {
+            update_retry::Failure::from_error("Could not remove incomplete update", &err, false)
+          })?;
         }
 
-        file
-          .write_all(&buffer[..read])
-          .map_err(|err| format!("Could not write update file: {err}"))?;
+        let response = reqwest::blocking::get(&download_url).map_err(|err| {
+          let retryable = !err.is_builder() && !err.is_redirect();
+          update_retry::Failure::from_error("Could not start update download", &err, retryable)
+        })?;
 
-        downloaded_bytes += read as u64;
+        if !response.status().is_success() {
+          let status = response.status();
+          return Err(update_retry::Failure::new(
+            format!("Update download failed with status {status}."),
+            status.is_server_error() || status == reqwest::StatusCode::REQUEST_TIMEOUT,
+          ));
+        }
 
-        let progress_percent = total_bytes.map(|total| {
-          if total == 0 {
-            0.0
-          } else {
-            (downloaded_bytes as f64 / total as f64) * 100.0
-          }
-        });
-
+        let total_bytes = response.content_length();
         let _ = app.emit(
-          UPDATE_DOWNLOAD_PROGRESS_EVENT,
-          UpdateDownloadProgressPayload {
+          UPDATE_DOWNLOAD_STARTED_EVENT,
+          UpdateDownloadStartedPayload {
             file_name: file_name.clone(),
-            downloaded_bytes,
             total_bytes,
-            progress_percent,
           },
         );
-      }
 
-      file
-        .flush()
-        .map_err(|err| format!("Could not finalize update file: {err}"))?;
+        let mut response = response;
+        let mut file = fs::File::create(&download_path).map_err(|err| {
+          update_retry::Failure::from_error("Could not create update file", &err, false)
+        })?;
+        let mut buffer = [0u8; 64 * 1024];
+        let mut downloaded_bytes = 0u64;
 
-      app
-        .state::<AppState>()
-        .set_pending_installer_path(download_path.clone());
+        loop {
+          let read = response.read(&mut buffer).map_err(|err| {
+            update_retry::Failure::from_error("Could not read update stream", &err, true)
+          })?;
 
-      let _ = app.emit(
-        UPDATE_DOWNLOAD_FINISHED_EVENT,
-        UpdateDownloadFinishedPayload {
-          file_name: file_name.clone(),
-          path: download_path.to_string_lossy().into_owned(),
-        },
-      );
+          if read == 0 {
+            break;
+          }
 
-      Ok(())
-    })();
+          file.write_all(&buffer[..read]).map_err(|err| {
+            update_retry::Failure::from_error("Could not write update file", &err, false)
+          })?;
+
+          downloaded_bytes += read as u64;
+
+          let progress_percent = total_bytes.map(|total| {
+            if total == 0 {
+              0.0
+            } else {
+              (downloaded_bytes as f64 / total as f64) * 100.0
+            }
+          });
+
+          let _ = app.emit(
+            UPDATE_DOWNLOAD_PROGRESS_EVENT,
+            UpdateDownloadProgressPayload {
+              file_name: file_name.clone(),
+              downloaded_bytes,
+              total_bytes,
+              progress_percent,
+            },
+          );
+        }
+
+        if let Some(expected) = total_bytes {
+          if downloaded_bytes != expected {
+            return Err(update_retry::Failure::new(
+              format!(
+                "Incomplete update download: received {downloaded_bytes} of {expected} bytes."
+              ),
+              true,
+            ));
+          }
+        }
+
+        file.flush().map_err(|err| {
+          update_retry::Failure::from_error("Could not finalize update file", &err, false)
+        })?;
+
+        app
+          .state::<AppState>()
+          .set_pending_installer_path(download_path.clone());
+
+        let _ = app.emit(
+          UPDATE_DOWNLOAD_FINISHED_EVENT,
+          UpdateDownloadFinishedPayload {
+            file_name: file_name.clone(),
+            path: download_path.to_string_lossy().into_owned(),
+          },
+        );
+
+        Ok(())
+      },
+      std::thread::sleep,
+    );
 
     if let Err(err) = result {
       let _ = fs::remove_file(&download_path);
@@ -2174,9 +2295,13 @@ pub fn run() {
   }
 
   let app = tauri::Builder::default()
+    .manage(clean_restart_environment(tauri::Env::default()))
     .manage(AppState::default())
     .invoke_handler(tauri::generate_handler![
       get_release_channel,
+      get_graphics_settings,
+      set_graphics_backend,
+      restart_app,
       get_launch_file_path,
       set_release_channel,
       app_ready_for_launch_context,
@@ -2201,18 +2326,17 @@ pub fn run() {
       tauri_plugin_window_state::Builder::default()
         .with_filter(|label| label == MAIN_WINDOW_LABEL)
         // Keep the splash/reveal flow in charge of visibility and preserve our custom frame.
-        .with_state_flags(
-          tauri_plugin_window_state::StateFlags::SIZE
-            | tauri_plugin_window_state::StateFlags::POSITION
-            | tauri_plugin_window_state::StateFlags::MAXIMIZED
-            | tauri_plugin_window_state::StateFlags::FULLSCREEN,
-        )
+        .with_state_flags(window_state_flags())
         .build(),
     )
     .setup(|app| {
       app.manage(DiscordPresence::new(DISCORD_APPLICATION_ID)?);
-      let channel = load_release_channel(app.handle());
-      app.state::<AppState>().set_release_channel(channel);
+      let config = load_app_config(app.handle());
+      app.manage(LaunchGraphics::new(
+        config.graphics_backend,
+        &env::var("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS").unwrap_or_default(),
+      ));
+      app.state::<AppState>().set_release_channel(config.release_channel);
       let context = parse_launch_context(
         env::args_os()
           .skip(1)
