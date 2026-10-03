@@ -30,8 +30,9 @@ DisableDirPage=yes
 DisableProgramGroupPage=yes
 
 [Files]
-Source: "..\build\steam\content\{#AppExeName}"; DestDir: "{app}"; Flags: ignoreversion
-Source: "..\build\steam\content\fileicons\bdengine-file.ico"; DestDir: "{app}\fileicons"; Flags: ignoreversion
+Source: "..\build\app\{#AppExeName}"; DestDir: "{app}"; Flags: ignoreversion
+Source: "..\build\app\LICENSE"; DestDir: "{app}"; DestName: "LICENSE.txt"; Flags: ignoreversion
+Source: "..\build\app\fileicons\bdengine-file.ico"; DestDir: "{app}\fileicons"; Flags: ignoreversion
 
 [Icons]
 Name: "{autoprograms}\{#AppName}"; Filename: "{app}\{#AppExeName}"; AppUserModelID: "app.bdengine.desktop"

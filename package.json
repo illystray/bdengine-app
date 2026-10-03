@@ -1,0 +1,23 @@
+{
+    "name":  "bdengine-app",
+    "version":  "1.0.16",
+    "private":  true,
+    "description":  "Windows desktop shell for https://bdengine.app",
+    "scripts":  {
+                    "tauri":  "tauri",
+                    "dev":  "tauri dev",
+                    "build:bin":  "tauri build --no-bundle",
+                    "build":  "powershell -ExecutionPolicy Bypass -File .\\scripts\\build.ps1",
+                    "fetch:webview2":  "powershell -ExecutionPolicy Bypass -File .\\scripts\\fetch-webview2.ps1"
+                },
+    "keywords":  [
+                     "tauri",
+                     "windows",
+                     "desktop",
+                     "bdengine"
+                 ],
+    "license":  "GPL-3.0-only",
+    "devDependencies":  {
+                            "@tauri-apps/cli":  "^2.10.1"
+                        }
+}

@@ -5,13 +5,29 @@
 !README.md
 !LICENSE
 
-# Keep only the desktop app source snapshot
+# Keep the build entry points and dependency lockfile
+!package.json
+!package-lock.json
+!scripts/
+scripts/*
+!scripts/build.ps1
+!scripts/fetch-webview2.ps1
+!redist/
+redist/*
+!redist/README.txt
+
+# Keep the desktop app sources and build resources
 !src-tauri/
 src-tauri/*
+!src-tauri/.gitignore
 !src-tauri/src/
 !src-tauri/src/**
 !src-tauri/icons/
 !src-tauri/icons/**
+!src-tauri/splash/
+src-tauri/splash/*
+!src-tauri/splash/splash.png
+!src-tauri/splash/splash.pdn
 !src-tauri/capabilities/
 !src-tauri/capabilities/**
 !src-tauri/Cargo.toml
