@@ -1,0 +1,9 @@
+Based on the published wry 0.54.4 crate from crates.io.
+
+BDEngine change: the WebView2 IPC callback ignores non-string messages instead
+of returning an error. WebView2 can then deliver object messages and attached
+browser Files to the application's own WebMessageReceived handler.
+
+Only src/webview2/mod.rs changes runtime behavior. Cargo.toml omits the example
+targets; examples and development-only repository files are not vendored.
+The original Apache-2.0 and MIT licenses are preserved alongside this file.

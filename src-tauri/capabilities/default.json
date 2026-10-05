@@ -18,6 +18,24 @@
                         "core:window:allow-minimize",
                         "core:window:allow-toggle-maximize",
                         "core:window:allow-close",
-                        "notification:default"
+                        "notification:default",
+                        "allow-get-release-channel",
+                        "allow-get-graphics-settings",
+                        "allow-set-graphics-backend",
+                        "allow-restart-app",
+                        "allow-get-launch-file-path",
+                        "allow-set-release-channel",
+                        "allow-app-ready-for-launch-context",
+                        "allow-write-project-file",
+                        "allow-save-binary-file",
+                        "allow-set-discord-presence",
+                        "allow-clear-discord-presence",
+                        "allow-download-update",
+                        "allow-clipboard-read-items",
+                        "allow-clipboard-write-items",
+                        "allow-minecraft-proxy-start",
+                        "allow-minecraft-proxy-stop",
+                        "allow-minecraft-proxy-status",
+                        "allow-minecraft-lan-discover"
                     ]
 }

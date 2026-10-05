@@ -44,6 +44,7 @@ use url::Url;
 use uuid::Uuid;
 mod discord_presence;
 mod graphics_backend;
+mod native_transport;
 mod update_retry;
 #[cfg(test)]
 mod config_tests;
@@ -75,7 +76,7 @@ const TASKBAR_ICON_PNG: &[u8] = include_bytes!("../icons/32x32.png");
 const SPLASH_IMAGE_PNG: &[u8] = include_bytes!("../splash/splash.png");
 const APP_CONFIG_FILE_NAME: &str = "config.json";
 const APP_IDENTIFIER: &str = "app.bdengine.desktop";
-const APP_VERSION: u32 = 16;
+const APP_VERSION: u32 = 17;
 const DISCORD_APPLICATION_ID: &str = "1514012998455529483";
 const DISCORD_LARGE_IMAGE_KEY: &str = "bde_logo";
 const DISCORD_OPEN_URL: &str = "https://bdengine.app";
@@ -2297,6 +2298,7 @@ pub fn run() {
   let app = tauri::Builder::default()
     .manage(clean_restart_environment(tauri::Env::default()))
     .manage(AppState::default())
+    .manage(native_transport::NativeTransport::default())
     .invoke_handler(tauri::generate_handler![
       get_release_channel,
       get_graphics_settings,
@@ -2315,9 +2317,15 @@ pub fn run() {
       minecraft_proxy_start,
       minecraft_proxy_stop,
       minecraft_proxy_status,
-      minecraft_lan_discover
+      minecraft_lan_discover,
+      native_transport::native_transport_info,
+      native_transport::http_upload_file,
+      native_transport::http_cancel_request,
+      native_transport::native_file_release
     ])
     .plugin(tauri_plugin_notification::init())
+    .plugin(native_transport::http_plugin())
+    .plugin(native_transport::plugin())
     .plugin(tauri_plugin_single_instance::init(|app, argv, _cwd| {
       let context = parse_launch_context(argv.into_iter().skip(1));
       let _ = apply_launch_context(app, context);

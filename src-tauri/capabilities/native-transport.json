@@ -1,0 +1,20 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "native-transport",
+  "description": "Editor transport: frontendDist is a local app origin in Tauri; every command also checks the exact editor origin and main window in Rust",
+  "local": true,
+  "windows": ["main"],
+  "remote": {
+    "urls": ["https://bdengine.app", "https://bdengine.app/*", "https://beta.bdengine.app", "https://beta.bdengine.app/*"]
+  },
+  "permissions": [
+    "allow-native-transport-info",
+    "allow-http-upload-file",
+    "allow-http-cancel-request",
+    "allow-native-file-release",
+    {
+      "identifier": "http:default",
+      "allow": [{ "url": "http://*:*/*" }, { "url": "https://*:*/*" }]
+    }
+  ]
+}

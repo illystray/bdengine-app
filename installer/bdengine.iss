@@ -1,5 +1,5 @@
 #define AppName "BDEngine"
-#define AppVersion "1.0.16"
+#define AppVersion "1.0.17"
 #define AppPublisher "illystray Creations"
 #define AppExeName "bdengine_app.exe"
 #define AppAssocName "BDEngine File"
@@ -32,6 +32,7 @@ DisableProgramGroupPage=yes
 [Files]
 Source: "..\build\app\{#AppExeName}"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\build\app\LICENSE"; DestDir: "{app}"; DestName: "LICENSE.txt"; Flags: ignoreversion
+Source: "..\build\app\licenses\*"; DestDir: "{app}\licenses"; Flags: ignoreversion recursesubdirs
 Source: "..\build\app\fileicons\bdengine-file.ico"; DestDir: "{app}\fileicons"; Flags: ignoreversion
 
 [Icons]

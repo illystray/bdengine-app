@@ -76,6 +76,17 @@ New-Item -ItemType Directory -Path $buildRoot | Out-Null
 Copy-Item -LiteralPath $binaryPath -Destination (Join-Path $buildRoot $binaryName)
 Copy-Item -LiteralPath $licensePath -Destination (Join-Path $buildRoot 'LICENSE')
 
+$wryLicenseRoot = Join-Path $buildRoot 'licenses\wry'
+New-Item -ItemType Directory -Path $wryLicenseRoot -Force | Out-Null
+foreach ($name in @('LICENSE-MIT', 'LICENSE-APACHE')) {
+  Copy-Item -LiteralPath (Join-Path $projectRoot "vendor\wry\$name") -Destination $wryLicenseRoot
+}
+$httpLicenseRoot = Join-Path $buildRoot 'licenses\tauri-plugin-http'
+New-Item -ItemType Directory -Path $httpLicenseRoot -Force | Out-Null
+foreach ($name in @('LICENSE_MIT', 'LICENSE_APACHE-2.0')) {
+  Copy-Item -LiteralPath (Join-Path $projectRoot "vendor\tauri-plugin-http\$name") -Destination $httpLicenseRoot
+}
+
 $fileIconsRoot = Join-Path $buildRoot 'fileicons'
 $fileIconIco = Join-Path $fileIconsRoot 'bdengine-file.ico'
 New-Item -ItemType Directory -Path $fileIconsRoot | Out-Null

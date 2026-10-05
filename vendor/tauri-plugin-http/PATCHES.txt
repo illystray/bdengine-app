@@ -1,0 +1,12 @@
+Based on the official tauri-plugin-http 2.5.9 crate from crates.io.
+The JavaScript API and command names remain compatible with 2.5.9.
+
+BDEngine changes:
+- Serialize native errors as {code, message}, without URLs or credentials.
+- Disable automatic request retries.
+- Release completed request resources and reject responses from a closed page.
+- Serialize response readers safely and cancel in-flight body reads when their
+  resource is closed, including page navigation cleanup.
+- Make repeated cancellation harmless.
+
+The original Apache-2.0 and MIT licenses are preserved alongside this file.

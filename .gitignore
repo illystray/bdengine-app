@@ -35,6 +35,13 @@ src-tauri/splash/*
 !src-tauri/tauri.conf.json
 !src-tauri/build.rs
 
+# Required patched dependency sources
+!vendor/
+!vendor/wry/
+!vendor/wry/**
+!vendor/tauri-plugin-http/
+!vendor/tauri-plugin-http/**
+
 # Keep the Inno Setup installer script
 !installer/
 installer/*

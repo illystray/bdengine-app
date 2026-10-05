@@ -1,6 +1,6 @@
 {
     "name":  "bdengine-app",
-    "version":  "1.0.16",
+    "version":  "1.0.17",
     "private":  true,
     "description":  "Windows desktop shell for https://bdengine.app",
     "scripts":  {
