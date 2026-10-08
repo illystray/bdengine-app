@@ -4,6 +4,7 @@
 !.gitignore
 !README.md
 !LICENSE
+!TRADEMARKS.md
 
 # Keep the build entry points and dependency lockfile
 !package.json

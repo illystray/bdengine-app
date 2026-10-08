@@ -43,3 +43,6 @@ Foundation, version 3 only (`GPL-3.0-only`).
 
 It is distributed without any warranty. See [LICENSE](LICENSE) for details.
 Third-party dependencies remain under their respective licenses.
+
+The GPL license does not grant trademark rights to the BDEngine name or logos.
+See [TRADEMARKS.md](TRADEMARKS.md) for the branding policy and permitted uses.
